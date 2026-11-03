@@ -1,0 +1,72 @@
+# AgentSpaces for Ruby repository.
+#
+# What must be COMMITTED and therefore is deliberately NOT listed here:
+#   Gemfile.lock      the resolved dependency set CI installs and the OSV scan reads
+#   .github/          the CI workflows
+#   gems/agentspaces/test/golden.json, social-golden.json   the vendored conformance vectors
+
+# Bundler and RubyGems
+.bundle/
+vendor/bundle/
+pkg/
+*.gem
+Gemfile.lock.bak
+gems/*/Gemfile.lock
+
+# The Java artifacts `rake jruby:jars` vendors into the JRuby gem (packaged in
+# the gem, never committed) and any Maven output beside its pom
+gems/agentspaces-jruby/jars/
+gems/agentspaces-jruby/target/
+target/
+
+# JRuby and the JVM
+*.class
+hs_err_pid*
+replay_pid*
+
+# Test, coverage, and documentation output
+coverage/
+test/reports/
+.yardoc/
+_yardoc/
+doc/
+rdoc/
+tmp/
+/tmp/
+
+# Type checking
+.gem_rbs_collection/
+sig/rbs_collection.lock.yaml
+
+# IDEs and editors
+.vscode/
+.idea/
+*.iml
+.ruby-lsp/
+.solargraph.yml
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and scratch
+*.log
+
+# Peer key material a running node persists (Identity.load_or_create); never
+# commit a private key, an invite key, or a model provider's API key.
+peer.key
+peer.keys/
+*-keys/
+*.pem
+*.p12
+*.jks
+*.key
+
+# Local environment and per-developer tool versions
+.env
+.env.local
+.envrc
+.ruby-version
+.tool-versions

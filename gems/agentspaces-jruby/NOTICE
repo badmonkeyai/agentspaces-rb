@@ -1,0 +1,21 @@
+AgentSpaces for Ruby
+Copyright 2026 Bad Monkey, Inc.
+
+This product includes software developed at
+Bad Monkey, Inc. (https://badmonkey.ai).
+
+The agentspaces-jruby gem carries, in jars/, the Java artifacts of
+agentspaces-runtime (Apache License 2.0, Bad Monkey, Inc.) and their runtime
+dependencies, unmodified, each with the licence files it ships:
+
+- Bouncy Castle (bcprov, bcpkix, bcutil): MIT License,
+  Copyright (c) The Legion of the Bouncy Castle Inc.
+- SLF4J API: MIT License, Copyright (c) QOS.ch Sarl
+- Jackson (annotations, core, databind, dataformat-cbor, datatype-jsr310):
+  Apache License 2.0, FasterXML, LLC
+- Caffeine: Apache License 2.0, Ben Manes
+- Nimbus JOSE + JWT: Apache License 2.0, Connect2id Ltd.
+- Error Prone annotations: Apache License 2.0, Google LLC
+- JSpecify: Apache License 2.0, the JSpecify authors
+
+The exact set follows gems/agentspaces-jruby/pom.xml for the gem's version.

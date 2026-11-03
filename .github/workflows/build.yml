@@ -1,0 +1,88 @@
+# Copyright 2026 Bad Monkey, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# Least privilege for the default GITHUB_TOKEN: the build only reads.
+permissions:
+  contents: read
+
+jobs:
+  # The pure-Ruby wire peer and the Rails, RubyLLM, and MCP gems, on the
+  # supported MRI floor and the current releases. No Java and no network
+  # beyond rubygems.org: the suites run on loopback and in-process fakes.
+  mri:
+    name: MRI ${{ matrix.ruby }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: [ '3.3', '3.4', '4.0' ]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ruby/setup-ruby@de492cf36cbab201753d720ce4f4e336cd688c94 # v1.336.0
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+      - name: Core, Rails, and AI suites, then the gem builds
+        run: bundle exec rake all build
+
+  # The same core suite on JRuby, where X25519 runs on the JDK provider.
+  jruby:
+    name: JRuby core
+    runs-on: ubuntu-latest
+    env:
+      BUNDLE_WITHOUT: rails:ai
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: ruby/setup-ruby@de492cf36cbab201753d720ce4f4e336cd688c94 # v1.336.0
+        with:
+          ruby-version: jruby-10.1
+          bundler-cache: true
+      - name: Core suite
+        run: bundle exec rake test
+
+  # The JRuby face binds through the Java binder of agentspaces-runtime. Its
+  # jars resolve from Maven Central, so this job fails until AgentSpaces 0.5.0
+  # is published there.
+  jruby-face:
+    name: JRuby face
+    runs-on: ubuntu-latest
+    env:
+      BUNDLE_WITHOUT: rails:ai
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - uses: ruby/setup-ruby@de492cf36cbab201753d720ce4f4e336cd688c94 # v1.336.0
+        with:
+          ruby-version: jruby-10.1
+          bundler-cache: true
+      - name: Vendor the agentspaces-runtime jars, then the face suite
+        run: bundle exec rake jruby:jars jruby:test

@@ -518,7 +518,15 @@ module AgentSpaces
           next if matches && !matches.call(payload, record["tags"] || {})
 
           price = bid.respond_to?(:call) ? Float(bid.call(payload)) : Float(bid)
+          # The list above is a snapshot, and each claim before this one waited out a
+          # settle window: judge this entry again against the claims folded since, as
+          # the TypeScript take does, so a lost race moves on to an entry nobody holds
+          # rather than claiming one after another that faster members already took.
+          now = now_ms
           current = claim_of(entry_id)
+          next if current && current.fetch("expiresAtMillis", 0).to_i > now
+          next if (@states[entry_id] || {})["completed"]
+
           epoch = current ? Integer(current["epoch"]) + 1 : 1
           claim = Wire.take_claim(entry_id, space_id, epoch, Wire.hlc_now(holder, now), holder, price,
                                   now + lease_millis)

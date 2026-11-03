@@ -64,7 +64,8 @@ class Councillor
   end
 end
 
-host = ARGV.fetch(0, "127.0.0.1")
+# "127.0.0.1" dials tcp; "tls://127.0.0.1" dials TLS 1.3 with this peer's channel certificate.
+scheme, host = ARGV.fetch(0, "127.0.0.1").then { |s| s.include?("://") ? s.split("://", 2) : ["tcp", s] }
 port = Integer(ARGV.fetch(1, "7470"))
 value = Float(ARGV.fetch(2, "10"))
 max_seconds = Float(ARGV.fetch(3, "90"))
@@ -72,7 +73,7 @@ max_seconds = Float(ARGV.fetch(3, "90"))
 identity = AgentSpaces::Identity.generate
 peer = AgentSpaces::Peer.new(identity, AgentSpaces::Derive.group_id_from_founding("research-fleet-demo-v1"))
 puts "ruby council worker #{identity.peer_id}"
-peer.connect(host, port)
+peer.connect(host, port, scheme: scheme)
 sleep 1
 peer.pull_ads
 pipes = AgentSpaces::Capabilities::Pipes.new(peer)

@@ -30,5 +30,5 @@ end
 
 group :ai do
   gem "ruby_llm", ">= 2.1"
-  gem "mcp", ">= 1.0"
+  gem "mcp", ">= 1.8", "< 2"
 end

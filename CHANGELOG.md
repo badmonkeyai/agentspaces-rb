@@ -33,6 +33,9 @@ The first release, on SPEC v0.1.23 and wire version 3. Not yet on RubyGems.org.
   keys, and bootstrap.
 - The `agentspaces` command: `id`, `check`, `doctor`, `status`, `work`,
   `console`.
+- `Peer#cards` leaves out the cards of a revoked peer, agent, or agent key,
+  as Java's ad cache does, so remote actions, RubyLLM tools, and MCP tools
+  never offer a revoked agent.
 
 ### `agentspaces-jruby`
 
@@ -51,7 +54,15 @@ The first release, on SPEC v0.1.23 and wire version 3. Not yet on RubyGems.org.
   `bin/rails agentspaces:work`, fork safety, notifications.
 - A fleet's AgentCards as RubyLLM tools, and lease keepalive for a take whose
   body waits on a model.
-- A fleet's remote actions as MCP tools on the official Ruby SDK.
+- A fleet's remote actions as MCP tools on the official Ruby SDK (`mcp` 1.8
+  or newer). Replicas of one worker are one tool, and different actions that
+  share a name get stable suffixed names (two replicas used to stop the server
+  with `MCP::ToolNotUnique`). `MCP.gateway` refreshes the tool list and sends
+  `notifications/tools/list_changed`, and a call to an action no longer
+  offered is refused. `only:` limits what is offered and `authorize:` checks
+  every call against the verified token. `MCP.http` builds the Streamable HTTP
+  transport and requires a `token_verifier` unless `allow_unauthenticated:
+  true`; `MCP::StaticTokens` verifies fixed bearer tokens.
 
 ### Proved against the other runtimes
 

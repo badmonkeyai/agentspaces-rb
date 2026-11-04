@@ -347,10 +347,19 @@ module AgentSpaces
       nil
     end
 
-    # The live AgentCards the ads stream carried.
+    # The live AgentCards the ads stream carried, without the cards of a
+    # revoked peer or a revoked agent or agent key (AdCache.refuseIssuers and
+    # refuseAgents, SPEC 6.1 v0.1.13: a revoked agent advertises nothing).
     def cards
       now = now_ms
-      @ads.values.select { |e| e["type"] == "AgentCard" && e["expires"] > now }.map { |e| e["ad"] }
+      @ads.values.select { |e| e["type"] == "AgentCard" && e["expires"] > now && !revoked_card?(e["ad"]) }
+          .map { |e| e["ad"] }
+    end
+
+    # Whether a card's issuer, or its agent or agent key, is revoked.
+    def revoked_card?(card)
+      @revocations.peer_revoked?(card["issuer"].to_s) ||
+        @revocations.refuses?(card["agent"], card["agentPublicKey"], nil)
     end
 
     # One capability frame to a member (CapabilityPipes.send).

@@ -181,7 +181,7 @@ PLATFORMS
 
 DEPENDENCIES
   agentspaces!
-  mcp (>= 1.0)
+  mcp (>= 1.8, < 2)
   minitest (>= 5.20)
   railties (>= 8.1)
   rake (>= 13.0)

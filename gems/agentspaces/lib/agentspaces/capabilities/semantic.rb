@@ -94,6 +94,7 @@ module AgentSpaces
           Array(ad["actions"]).each { |action| text += " #{action['name']} #{action['description']}" }
           text
         when "AssetCard" then "#{ad['description']} #{ad['asset']} #{ad['uri']} #{ad['shape']}"
+        when "ModelCard" then "#{ad['name']} #{ad['version']} #{Array(ad['tasks']).join(' ')} #{ad['modality']} #{ad['engine']} #{ad['licence']}"
         when "CapabilityAdvertisement"
           parameters = (ad["parameters"] || {}).map { |k, v| "#{k}=#{v}" }.join(", ")
           "#{ad['capabilityType']} #{ad['binding']} {#{parameters}}"

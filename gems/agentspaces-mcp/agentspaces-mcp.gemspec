@@ -35,5 +35,6 @@ Gem::Specification.new do |spec|
   spec.files = Dir["lib/**/*.rb", "README.md", "LICENSE", "NOTICE"]
   spec.require_paths = ["lib"]
   spec.add_dependency "agentspaces", AgentSpaces::VERSION
-  spec.add_dependency "mcp", ">= 1.0"
+  # token_verifier on the Streamable HTTP transport and Server#notify_tools_list_changed, tested on 1.8.
+  spec.add_dependency "mcp", ">= 1.8", "< 2"
 end

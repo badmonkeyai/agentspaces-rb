@@ -232,6 +232,9 @@ class CapabilitiesTest < Minitest::Test
     assert_equal "d g1 g2 c p n nd", Semantic.text_of("AgentCard", card)
     assert_equal "d a u s", Semantic.text_of("AssetCard", { "description" => "d", "asset" => "a", "uri" => "u",
                                                              "shape" => "s" })
+    assert_equal "m 1 classify embed text onnx Apache-2.0",
+                 Semantic.text_of("ModelCard", { "name" => "m", "version" => "1", "tasks" => %w[classify embed],
+                                                 "modality" => "text", "engine" => "onnx", "licence" => "Apache-2.0" })
     assert_equal "aspace:cap/aggregate pipe {modes=sum,avg}",
                  Semantic.text_of("CapabilityAdvertisement", { "capabilityType" => "aspace:cap/aggregate",
                                                                "binding" => "pipe",

@@ -95,6 +95,7 @@ module AgentSpaces
           text
         when "AssetCard" then "#{ad['description']} #{ad['asset']} #{ad['uri']} #{ad['shape']}"
         when "ModelCard" then "#{ad['name']} #{ad['version']} #{Array(ad['tasks']).join(' ')} #{ad['modality']} #{ad['engine']} #{ad['licence']}"
+        when "AppCard" then "#{ad['name']} #{ad['kind']} #{ad['shape']} #{ad['owner']} #{ad['url']}"
         when "CapabilityAdvertisement"
           parameters = (ad["parameters"] || {}).map { |k, v| "#{k}=#{v}" }.join(", ")
           "#{ad['capabilityType']} #{ad['binding']} {#{parameters}}"

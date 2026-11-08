@@ -9,6 +9,40 @@ The first release, on SPEC v0.1.23 and wire version 3. Not yet on RubyGems.org.
 
 ### `agentspaces`
 
+- The peer refuses a remote HLC stamp whose logical counter is above 65536
+  (`Wire::HLC_LOGICAL_LIMIT`) at every merge point: a frame, a folded record
+  or lease stamp, and a folded claim. The local clock carries into the next
+  millisecond at the limit and never repeats a stamp (HLC logical counter,
+  2026-11-08 (Rust team report)).
+- Round two: one strict parser, `Wire.hlc_parse`, reads every stamp the peer
+  merges or orders as Java's `HlcTimestamp.parse` reads it, so the peer also
+  refuses a negative, unreadable (`x`, `0x10001`), fractional, or missing
+  part. Frames count in `peer.frames.refused` (formerly `.logical`), states
+  and claims in `peer.refused_stamps`; `Wire.merge_claims` never keeps a
+  claim with a refused stamp, so no hostile claim wedges its entry. The
+  clock clamps a remote physical part at one millisecond inside the drift
+  bound, so a carry lands at most on the bound (HLC logical counter,
+  2026-11-08 (Rust team report)).
+- Round three (HLC canonical stamps, 2026-11-08): the peer decodes a stamp
+  only in the canonical grammar (no leading zero, ASCII digits, no control
+  character in the node, text and never a CBOR byte string), so a claim
+  signed over `007:0:n` can no longer replace an honest claim. The
+  `FrameFilter` judges a stamp in the order of SPEC §9 and counts a frame
+  just past the drift bound, within the five-second skew margin, in
+  `peer.frames.skewed`. The peer counts a refused state or claim after its
+  signature verifies, once per distinct one, no longer judges `signedAt`
+  against the logical limit, orders nodes and holders by UTF-16 code units,
+  and reads a PDT head's `pdt.issued` as Java's `Refs` reads it.
+- `AgentSpaces::PDT`, the reading face of the persistent data trees
+  (srad/agentspaces-pdt.md PD-C-06): the node codec and CIDs, `PMap`, `PSet`,
+  `PVector`, and `PBlob` over a node store that `NODE_WANT` and `TREE_WANT`
+  fetches fill from members advertising `trees`, and `Pdt#map_ref(name).deref`
+  with inline deltas applied, the rest fetched from the head's issuer, and
+  several heads merged as the Java reader merges them. Reading only. Every
+  `pdt_*` and `content_*` tree vector of golden.json passes.
+- The peer advertises `wire.recordless` and accepts a renew, cancel, or
+  complete whose state carries no record: merged over the record it holds, or
+  pending without an event until the whole DTO arrives (PD-L-04).
 - A pure-Ruby wire peer for MRI 3.3 or newer and JRuby 10.1, with no native
   extension and one runtime dependency (`logger`). It reproduces all 212
   golden vectors of the specification byte for byte and refuses the 36

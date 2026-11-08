@@ -44,9 +44,19 @@ module AgentSpaces
       end
     end
 
+    # The wire hint that says this client accepts a renew, cancel, or complete
+    # whose EntryStateDto carries no record (SPEC v0.1.17 §9 hints;
+    # srad/agentspaces-pdt.md 3.9, PD-L-04).
+    RECORDLESS_HINT = "wire.recordless"
+    # Recordless states held for entries whose record has not arrived: at most this many.
+    MAX_PENDING_STATES = 1024
+    # How many distinct refused states and claims the peer remembers, so an
+    # offer it already counted counts once (HLC canonical stamps, 2026-11-08).
+    REFUSED_STAMP_MEMORY = 4096
+
     attr_reader :identity, :group, :states, :claims, :members, :reachable, :ads, :pipe_handlers, :revocations,
                 :founding, :frames, :ignored_kinds, :malformed_frames, :reconnects, :seed_peer, :resource_hints,
-                :blocks, :relayed_frames, :relay_signals, :clock, :seeds, :logger
+                :blocks, :relayed_frames, :relay_signals, :clock, :seeds, :logger, :wire_hints, :pending_states
     attr_accessor :on_state, :on_claim, :reconnect_interval, :reconnect_window, :peer_ad_interval, :pinned_invite,
                   :refresh_seeds, :delegation
     # :session (the default and dev-local's): advertise wire.session=1 and,
@@ -79,10 +89,18 @@ module AgentSpaces
       @frames = Wire::FrameFilter.new
       @ignored_kinds = Hash.new(0)
       @malformed_frames = 0
+      @refused_stamps = { "states" => 0, "claims" => 0 }
+      @refused_offers = {}
       @seed = nil
       @seeds = []
       @refresh_seeds = nil
       @resource_hints = {}
+      # The wire hints beside the resource hints in the self-advertisement:
+      # wire.recordless says a recordless renew, cancel, or complete is accepted.
+      @wire_hints = { RECORDLESS_HINT => "1" }
+      # Recordless states by entry id, kept without an event until the whole
+      # DTO arrives through anti-entropy (PD-L-02).
+      @pending_states = {}
       @pinned_invite = nil
       @delegation = nil
       @pulled_spaces = Set.new
@@ -233,7 +251,8 @@ module AgentSpaces
     # Publishes this peer's leased self-advertisement (SPEC 5.2).
     def introduce
       now = now_ms
-      hints = @channel_auth == :session ? @resource_hints.merge(Session::HINT => "1") : @resource_hints
+      hints = @resource_hints.merge(@wire_hints)
+      hints = hints.merge(Session::HINT => "1") if @channel_auth == :session
       ad = Wire.peer_advertisement(@group, @identity, Instants.iso(now - (now % 1000)), "PT10M", hints)
       send_frame("RUMOR", Wire.rumor_body("peers", "peer:#{@identity.peer_id}:#{now}", Wire::HOPS,
                                           Wire.signed_peer_ad(ad, @identity)))
@@ -443,9 +462,18 @@ module AgentSpaces
     # Folds one received state DTO: verified (record and transition), refused
     # when its actor is revoked, then joined as the Java CRDT joins it.
     def fold_state(dto)
-      record = dto["record"] || {}
+      return fold_recordless(dto) if dto["record"].nil?
+
+      record = dto["record"]
       entry_id = record["entryId"]
       return unless entry_id && verify_state(dto, record)
+      # HLC logical counter, 2026-11-08 (Rust team report): the peer drops a
+      # state whose issue stamp or lease stamp the strict parser refuses. It
+      # counts the refusal after verification, once per distinct state, as
+      # Java's ReplicatedSpace does (HLC canonical stamps, 2026-11-08).
+      return refuse_stamp("states", dto) unless state_stamps_acceptable?(dto, record)
+
+      pending = @state_lock.synchronize { @pending_states.delete(entry_id) }
       return if refused_for_revocation?(dto, record)
 
       merged = @state_lock.synchronize do
@@ -455,6 +483,41 @@ module AgentSpaces
       @on_state&.call(merged)
       notify_observers { |o| o.state_folded(merged) }
       wake_fold_waiters
+      fold_recordless(pending) unless pending.nil?
+    end
+
+    # A renew, cancel, or complete without its record (srad/agentspaces-pdt.md
+    # 3.9, PD-L-01, PD-L-02): merged through every check with the record this
+    # replica holds, else kept pending with no event until anti-entropy ships
+    # the whole DTO. The entry id is the DTO's entryId or the one the rumor
+    # item named.
+    def fold_recordless(dto)
+      entry_id = dto["entryId"]
+      return unless entry_id.is_a?(String) && !entry_id.empty?
+
+      previous = @state_lock.synchronize { @states[entry_id] }
+      if previous.nil?
+        @state_lock.synchronize do
+          @pending_states.shift while @pending_states.size >= MAX_PENDING_STATES
+          @pending_states[entry_id] = dto
+        end
+        return
+      end
+      full = dto.merge("record" => previous["record"])
+      %w[issuerPublicKey agentCertificate].each do |carried|
+        full[carried] = previous[carried] if full[carried].nil? && !previous[carried].nil?
+      end
+      fold_state(full)
+    end
+
+    # Fills entryId of a recordless state from the rumor item id (r:<id>:<stamp>,
+    # d:<id>) when the DTO does not carry one.
+    def name_recordless(state, item_id)
+      return state unless state.is_a?(Hash) && state["record"].nil? && !state["entryId"] && item_id.is_a?(String)
+
+      parts = item_id.split(":")
+      state["entryId"] = parts[1] if parts.size >= 2 && %w[r d x c].include?(parts[0])
+      state
     end
 
     # Folds one signed claim after validating its bindings, bounds, proof,
@@ -470,11 +533,15 @@ module AgentSpaces
       expires = claim["expiresAtMillis"]
       return unless epoch.is_a?(Integer) && epoch.positive? && expires.is_a?(Integer)
       return unless bid.is_a?(Numeric) && !(bid.is_a?(Float) && (bid.nan? || bid.infinite?))
-      return unless claim["stamp"].is_a?(String)
       return unless Wire.verify_claim_proof(signed, now_ms)
 
       certificate = signed["holderCertificate"] || {}
       return if @revocations.refuses?(claim["holder"], certificate["agentPublicKey"], nil)
+      # HLC logical counter, 2026-11-08 (Rust team report): the peer drops a
+      # claim whose stamp the strict parser refuses. It counts the refusal
+      # after verification, once per distinct claim, as Java's mergeClaim does
+      # (HLC canonical stamps, 2026-11-08).
+      return refuse_stamp("claims", [entry_id, signed]) unless Wire.hlc_acceptable?(claim["stamp"])
 
       current = claim_of(entry_id)
       observed = (current || {}).fetch("epoch", 0).to_i
@@ -496,6 +563,12 @@ module AgentSpaces
     end
 
     def claim_of(entry_id) = @claims[entry_id]&.fetch("claim")
+
+    # Counts of verified states and claims refused for a stamp the strict
+    # parser refuses, each distinct one once (HLC logical counter, 2026-11-08
+    # (Rust team report); HLC canonical stamps, 2026-11-08). A Ruby peer
+    # keeps no per-member strikes, so these counts are its record.
+    def refused_stamps = @state_lock.synchronize { @refused_stamps.dup }
 
     # ----------------------------------------------------------- take/complete
 
@@ -980,7 +1053,7 @@ module AgentSpaces
 
         # Claim before state: a completion authenticates against the claim.
         fold_claim(delta["claimEntry"], delta["claim"]) if delta["claimEntry"] && delta["claim"].is_a?(Hash)
-        fold_state(delta["state"]) if delta["state"].is_a?(Hash)
+        fold_state(name_recordless(delta["state"], rumor["itemId"])) if delta["state"].is_a?(Hash)
       end
     end
 
@@ -1042,13 +1115,46 @@ module AgentSpaces
       merged = previous.dup
       merged["adds"] = union_dots(previous["adds"], incoming["adds"])
       merged["removes"] = union_dots(previous["removes"], incoming["removes"])
-      if (Wire.hlc_tuple(incoming.fetch("leaseStamp", "0:0:")) <=>
-          Wire.hlc_tuple(previous.fetch("leaseStamp", "0:0:"))).positive?
+      if lease_newer?(incoming["leaseStamp"], previous["leaseStamp"])
         merged["leaseStamp"] = incoming["leaseStamp"]
         merged["leaseValue"] = incoming["leaseValue"]
       end
       merged["completed"] = previous["completed"] ? true : (incoming["completed"] ? true : false)
       merged
+    end
+
+    # Whether an incoming lease stamp supersedes the held one. fold_state
+    # admits only stamps the strict parser accepts, and a state without a
+    # lease stamp keeps the held lease.
+    def lease_newer?(incoming, held)
+      return false if incoming.nil?
+      return true if held.nil?
+
+      (Wire.hlc_order(incoming) <=> Wire.hlc_order(held)).positive?
+    end
+
+    # HLC logical counter, 2026-11-08 (Rust team report): the stamps a state
+    # feeds the clock, as ReplicatedSpace.stampsAcceptable reads them. The
+    # record's issue stamp is required and the lease stamp optional. signedAt
+    # never reaches a clock, so verification decodes it and nothing judges it
+    # against the logical limit, as in Java (HLC canonical stamps, 2026-11-08).
+    def state_stamps_acceptable?(dto, record)
+      Wire.hlc_acceptable?(record["issued"]) && (dto["leaseStamp"].nil? || Wire.hlc_acceptable?(dto["leaseStamp"]))
+    end
+
+    # Counts a verified state or claim refused for its stamp, once per
+    # distinct offer: a partner re-offering it every anti-entropy round counts
+    # once (HLC canonical stamps, 2026-11-08).
+    def refuse_stamp(kind, offered)
+      key = "#{kind}:#{Crypto.port.sha256(CBOR.dump(offered)).unpack1('H*')}"
+      @state_lock.synchronize do
+        next if @refused_offers.key?(key)
+
+        @refused_offers[key] = true
+        @refused_offers.shift if @refused_offers.size > REFUSED_STAMP_MEMORY
+        @refused_stamps[kind] += 1
+      end
+      nil
     end
 
     def union_dots(left, right)

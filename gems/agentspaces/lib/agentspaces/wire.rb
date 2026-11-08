@@ -35,44 +35,80 @@ module AgentSpaces
     MAX_CLAIM_HOLD_MILLIS = 24 * 60 * 60 * 1000
     # How far ahead of this peer's wall clock a remote stamp may run (ASF-020/043).
     MAX_HLC_SKEW_MILLIS = 10 * 60 * 1000
+    # HLC canonical stamps, 2026-11-08: how far past wall + MAX_HLC_SKEW_MILLIS
+    # a frame's stamp may run and still read as host clock skew. An attacker
+    # can drag an honest peer's clock to its own wall + MAX_HLC_SKEW_MILLIS,
+    # and a receiver whose wall trails that peer's by a few seconds then sees
+    # its frames just past the bound; the filter drops and counts them as
+    # skewed, where a Java receiver strikes nobody for them.
+    HLC_SKEW_MARGIN_MILLIS = 5_000
+    # HLC logical counter, 2026-11-08 (Rust team report): the largest logical
+    # counter a remote stamp may carry. Every merge point refuses a stamp above
+    # it, and the local clock carries into the next millisecond at it, so a
+    # signed stamp with a saturated counter can never freeze this clock or a
+    # replica's leases and claims. An honest counter resets every millisecond
+    # and stays far below 2^16; Java, Rust, Python, and TypeScript share the value.
+    HLC_LOGICAL_LIMIT = 65_536
+    # The largest physical part Java's Long.parseLong reads.
+    HLC_PHYSICAL_MAX = (2**63) - 1
+    # The largest logical part Java's Integer.parseInt reads. A stamp whose
+    # counter lies above HLC_LOGICAL_LIMIT and at most this decodes, so a
+    # signature over it verifies, and every merge point then refuses it.
+    HLC_LOGICAL_DECODE_MAX = (2**31) - 1
+    # HLC canonical stamps, 2026-11-08: the one stamp text every
+    # implementation decodes. Physical and logical parts are "0" or a non-zero
+    # ASCII digit followed by ASCII digits, with no sign, fraction, exponent,
+    # whitespace, or leading zero, and no more digits than the largest value
+    # of each part holds; the node is non-empty and holds no colon and no
+    # control character (U+0000..U+001F, U+007F). The text of a stamp that
+    # matches equals its re-encoding, so a signer's bytes and a reader's
+    # stamp never differ.
+    HLC_STAMP = /\A(0|[1-9][0-9]{0,18}):(0|[1-9][0-9]{0,9}):([^:\x00-\x1F\x7F]+)\z/
     # ROBUSTNESS.md 3.3 and 3.4: the stale bound and the replay memory.
     MAX_FRAME_AGE_MILLIS = 5 * 60 * 1000
     FRAME_FILTER_CAPACITY = 4096
     RELAY_SIGNAL_CAPABILITY = "aspace:cap/relay-signal"
     HOPS = 6
 
-    # Admits each verified frame once, fresh: a stamp older than
-    # MAX_FRAME_AGE_MILLIS is stale, one further ahead than
-    # MAX_HLC_SKEW_MILLIS is refused, and a (sender, stamp) pair seen before
-    # is a replay. All three are dropped silently and counted.
+    # Admits each verified frame once, fresh, judging its stamp in the order
+    # of SPEC 9 as Java's PeerNode does (HLC canonical stamps, 2026-11-08).
+    # It drops each refusal silently and counts it:
+    # 1. refused, a stamp that does not decode (Wire.hlc_decode);
+    # 2. stale, a stamp older than MAX_FRAME_AGE_MILLIS;
+    # 3. replayed, a (sender, stamp) pair it has seen; the memory records
+    #    every fresh frame before the checks below, as Java's does;
+    # 4. skewed, a stamp past wall + MAX_HLC_SKEW_MILLIS by at most
+    #    HLC_SKEW_MARGIN_MILLIS, and ahead, a stamp further past it;
+    # 5. refused, a logical counter above HLC_LOGICAL_LIMIT.
+    # A Ruby peer keeps no strikes, so these counts are its whole record.
     class FrameFilter
-      attr_reader :stale, :ahead, :replayed
+      attr_reader :stale, :ahead, :skewed, :refused, :replayed
 
       def initialize(capacity = FRAME_FILTER_CAPACITY)
         @seen = {}
         @capacity = capacity
         @stale = 0
         @ahead = 0
+        @skewed = 0
+        @refused = 0
         @replayed = 0
         @lock = Mutex.new
       end
 
       def admit(env, now_ms)
         stamp = env["stamp"]
-        physical = begin
-          Wire.hlc_physical(stamp)
-        rescue ArgumentError, TypeError
-          return false
-        end
+        decoded = Wire.hlc_decode(stamp)
         @lock.synchronize do
+          if decoded.nil?
+            @refused += 1
+            return false
+          end
+          physical, logical = decoded
           if now_ms - physical > MAX_FRAME_AGE_MILLIS
             @stale += 1
             return false
           end
-          if physical - now_ms > MAX_HLC_SKEW_MILLIS
-            @ahead += 1
-            return false
-          end
+          # A decoded stamp is canonical, so its text is the replay key.
           key = "#{env['from']}|#{stamp}"
           if @seen.key?(key)
             @replayed += 1
@@ -80,11 +116,26 @@ module AgentSpaces
           end
           @seen[key] = true
           @seen.shift if @seen.size > @capacity
+          past = physical - now_ms - MAX_HLC_SKEW_MILLIS
+          if past > HLC_SKEW_MARGIN_MILLIS
+            @ahead += 1
+            return false
+          end
+          if past.positive?
+            @skewed += 1
+            return false
+          end
+          if logical > HLC_LOGICAL_LIMIT
+            @refused += 1
+            return false
+          end
           true
         end
       end
 
-      def to_h = { "stale" => @stale, "ahead" => @ahead, "replayed" => @replayed }
+      def to_h
+        { "stale" => @stale, "ahead" => @ahead, "skewed" => @skewed, "refused" => @refused, "replayed" => @replayed }
+      end
     end
 
     @hlc_lock = Mutex.new
@@ -94,12 +145,18 @@ module AgentSpaces
       # A fresh hybrid-logical-clock stamp in the Java string form: physical
       # time never runs backwards, and the logical counter increments within
       # one millisecond, so stamps after an observed remote stamp sort after it.
+      # A counter at HLC_LOGICAL_LIMIT carries into the next millisecond, so the
+      # clock never repeats a stamp and never sends a counter a receiver refuses
+      # (HLC logical counter, 2026-11-08 (Rust team report)).
       def hlc_now(node, now_ms = nil)
         wall = now_ms.nil? ? (Time.now.to_f * 1000).to_i : Integer(now_ms)
         physical, logical = @hlc_lock.synchronize do
           physical, logical = @hlc_state.fetch(node, [0, -1])
           if wall > physical
             physical = wall
+            logical = 0
+          elsif logical >= HLC_LOGICAL_LIMIT
+            physical += 1
             logical = 0
           else
             logical += 1
@@ -110,33 +167,90 @@ module AgentSpaces
       end
 
       # The physical milliseconds of an HLC stamp string: its signing time.
+      # Raises ArgumentError for a stamp that does not decode. A signing time
+      # never reaches a clock, so it is not judged against HLC_LOGICAL_LIMIT,
+      # as Java reads a record's, claim's, or state's signedAt.
       def hlc_physical(stamp)
-        raise TypeError, "no stamp" unless stamp.is_a?(String)
-
-        Integer(stamp.split(":", 2).first, 10)
+        decoded = hlc_decode(stamp) or raise ArgumentError, "not a canonical HLC stamp: #{stamp.inspect}"
+        decoded.first
       end
 
-      # Merges a remote stamp into the local clock; remote physicals beyond
-      # the skew ceiling are ignored, so a hostile far-future stamp cannot pin
-      # this clock (ASF-020).
-      def hlc_observe(node, stamp, now_ms = nil)
-        parts = stamp.to_s.split(":", 3)
-        physical = Integer(parts[0], 10)
-        logical = Integer(parts[1], 10)
-        wall = now_ms.nil? ? (Time.now.to_f * 1000).to_i : Integer(now_ms)
-        return if physical > wall + MAX_HLC_SKEW_MILLIS
+      # The decoder every stamp read shares (HLC canonical stamps,
+      # 2026-11-08): [physical, logical, node] for UTF-8 text in the
+      # canonical grammar (HLC_STAMP) whose physical part fits a signed
+      # 64-bit integer and whose logical part fits a signed 32-bit integer,
+      # as Java's HlcTimestamp.parse reads it, and nil for anything else,
+      # a CBOR byte string included.
+      def hlc_decode(stamp)
+        return nil unless stamp.is_a?(String) && [Encoding::UTF_8, Encoding::US_ASCII].include?(stamp.encoding)
+        return nil unless stamp.valid_encoding?
 
+        match = HLC_STAMP.match(stamp)
+        return nil if match.nil?
+
+        physical = Integer(match[1], 10)
+        logical = Integer(match[2], 10)
+        return nil if physical > HLC_PHYSICAL_MAX || logical > HLC_LOGICAL_DECODE_MAX
+
+        [physical, logical, match[3]]
+      end
+
+      # The strict parser every merge and ordering point shares (HLC logical
+      # counter, 2026-11-08 (Rust team report); HLC canonical stamps,
+      # 2026-11-08): the decoded stamp when its logical counter is at most
+      # HLC_LOGICAL_LIMIT, and nil for anything else.
+      def hlc_parse(stamp)
+        decoded = hlc_decode(stamp)
+        decoded unless decoded.nil? || decoded[1] > HLC_LOGICAL_LIMIT
+      end
+
+      # True when the strict parser accepts a stamp, the test every merge
+      # point applies before it folds a remote stamp (HLC logical counter,
+      # 2026-11-08 (Rust team report)).
+      def hlc_acceptable?(stamp) = !hlc_parse(stamp).nil?
+
+      # A stamp as a comparable [physical, logical, node]; raises
+      # ArgumentError for a stamp the strict parser refuses, so no ordering
+      # ever compares a hostile counter.
+      def hlc_tuple(stamp)
+        hlc_parse(stamp) or raise ArgumentError, "not an acceptable HLC stamp: #{stamp.inspect}"
+      end
+
+      # A stamp's sort key in Java's HlcTimestamp order: physical, logical,
+      # then the node by UTF-16 code units (HLC canonical stamps, 2026-11-08).
+      # Raises ArgumentError for a stamp the strict parser refuses.
+      def hlc_order(stamp)
+        physical, logical, node = hlc_tuple(stamp)
+        [physical, logical, java_order(node)]
+      end
+
+      # A String's sort key in Java's String.compareTo order, by UTF-16 code
+      # units, where Ruby's String#<=> orders UTF-8 bytes, the code point
+      # order: U+1F600 (D83D DE00) sorts before U+FF61 in Java and after it
+      # in Ruby (HLC canonical stamps, 2026-11-08). Text that is not valid
+      # Unicode keeps its byte order.
+      def java_order(text)
+        text.to_s.encode(Encoding::UTF_16BE).b
+      rescue EncodingError
+        text.to_s.b
+      end
+
+      # Merges a remote stamp into the local clock. The clock ignores a stamp
+      # the strict parser refuses, and it clamps a remote physical part at one
+      # millisecond inside the skew ceiling, so a carry after the merge lands
+      # at most on the ceiling and a receiver's far-future check (ASF-020,
+      # strictly greater than wall + MAX_HLC_SKEW_MILLIS) never strikes this
+      # honest peer (HLC logical counter, 2026-11-08 (Rust team report)).
+      def hlc_observe(node, stamp, now_ms = nil)
+        parsed = hlc_parse(stamp)
+        return if parsed.nil?
+
+        wall = now_ms.nil? ? (Time.now.to_f * 1000).to_i : Integer(now_ms)
+        remote = [[parsed[0], wall + MAX_HLC_SKEW_MILLIS - 1].min, parsed[1]]
         @hlc_lock.synchronize do
           current = @hlc_state.fetch(node, [0, -1])
-          @hlc_state[node] = [physical, logical] if ([physical, logical] <=> current).positive?
+          @hlc_state[node] = remote if (remote <=> current).positive?
         end
-      rescue ArgumentError, TypeError
-        nil
-      end
-
-      def hlc_tuple(stamp)
-        physical, logical, node = stamp.to_s.split(":", 3)
-        [Integer(physical, 10), Integer(logical, 10), node.to_s]
       end
 
       # An Envelope in field order: ver, group, kind, from, to, stamp, body.
@@ -441,13 +555,19 @@ module AgentSpaces
 
       # The claim lattice's total order (SPEC 7.4): the smallest key wins.
       # Epoch descending, bid ascending, HLC stamp ascending, holder
-      # ascending, expiry descending; identical to TakeClaim.merge.
+      # ascending, expiry descending; identical to TakeClaim.merge, strings
+      # compared as Java compares them (HLC canonical stamps, 2026-11-08).
       def claim_sort_key(claim)
-        [-Integer(claim.fetch("epoch", 0)), Float(claim.fetch("bid", 0.0)), hlc_tuple(claim.fetch("stamp", "0:0:")),
-         claim.fetch("holder", "").to_s, -Integer(claim.fetch("expiresAtMillis", 0))]
+        [-Integer(claim.fetch("epoch", 0)), Float(claim.fetch("bid", 0.0)), hlc_order(claim["stamp"]),
+         java_order(claim.fetch("holder", "")), -Integer(claim.fetch("expiresAtMillis", 0))]
       end
 
+      # Joins two signed claims. A side whose stamp the strict parser refuses
+      # never wins, so a hostile claim cannot make every later honest claim on
+      # its entry raise (HLC logical counter, 2026-11-08 (Rust team report)).
       def merge_claims(left, right)
+        left = nil unless left.nil? || hlc_acceptable?((left["claim"] || {})["stamp"])
+        right = nil unless right.nil? || hlc_acceptable?((right["claim"] || {})["stamp"])
         return right if left.nil?
         return left if right.nil?
 

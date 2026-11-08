@@ -390,8 +390,10 @@ class BootstrapTest < Minitest::Test
       assert_equal CBOR.load(Base64Text.decode(SOCIAL["founding_cbor_base64"])), peer.founding
       wait_until { seed.kinds.size >= 2 }
       ad = self_ad(seed)
-      # The join hint rides beside the session hint, as the Java node's does in SESSION mode.
-      assert_equal({ "aspace:join" => SOCIAL["credential"], Session::HINT => "1" }, ad["resourceHints"])
+      # The join hint rides beside the session hint, as the Java node's does in SESSION mode, and
+      # beside the recordless wire hint (srad/agentspaces-pdt.md PD-L-04).
+      assert_equal({ "aspace:join" => SOCIAL["credential"], Session::HINT => "1", Peer::RECORDLESS_HINT => "1" },
+                   ad["resourceHints"])
       assert_equal SOCIAL["candidate_peer_id"], ad["issuer"]
       assert_equal SOCIAL["group_id"], ad["group"]
       # The hint is bound into the signed advertisement bytes.

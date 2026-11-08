@@ -175,6 +175,8 @@ class GoldenTest < Minitest::Test
     names = GOLDEN.keys.select { |n| n.end_with?("_cbor", "_delta") }
     assert_operator names.size, :>=, 35
     names.each do |name|
+      # A persistent-tree node is a definite-length map (srad/agentspaces-pdt.md 10.2), not a
+      # Jackson record; PdtTest reads the node vectors through the node codec.
       next if name == "adv_deep_nesting_cbor"
 
       raw = hex(name)

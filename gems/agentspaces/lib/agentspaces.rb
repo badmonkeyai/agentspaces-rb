@@ -40,6 +40,7 @@ require_relative "agentspaces/agent"
 require_relative "agentspaces/binder"
 require_relative "agentspaces/config"
 require_relative "agentspaces/capabilities"
+require_relative "agentspaces/pdt"
 
 # AgentSpaces for Ruby: a wire-compatible peer of the AgentSpaces fleet
 # (SPEC v0.1.23, wire version 3), the Layer 3 verbs over typed entries, and

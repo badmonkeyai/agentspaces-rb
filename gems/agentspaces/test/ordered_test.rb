@@ -212,7 +212,7 @@ class OrderedTest < Minitest::Test
     assert_equal %w[entryId claim holderKey signature holderCertificate], command.keys
     assert Wire.verify_claim_proof({ "claim" => command["claim"], "holderKey" => command["holderKey"],
                                      "signature" => command["signature"],
-                                     "holderCertificate" => command["holderCertificate"] }, now + 1_000)
+                                     "holderCertificate" => command["holderCertificate"] })
   end
 
   # ------------------------------------------------------------ the client

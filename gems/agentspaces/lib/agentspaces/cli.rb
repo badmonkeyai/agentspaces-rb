@@ -120,6 +120,7 @@ module AgentSpaces
       @out.puts("cards    #{cards.size}")
       cards.each do |card|
         @out.puts("  #{card['agent']}: #{card['description']}")
+        @out.puts("    spilled: #{card['spill']['parts'].join(', ')} (in its parts document)") if card["spill"]
         Array(card["actions"]).each do |a|
           @out.puts("    #{a['name']} (#{a['kind']}) #{Array(a['consumes']).join(', ')} -> #{Array(a['produces']).join(', ')}")
         end

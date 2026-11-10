@@ -88,10 +88,11 @@ module AgentSpaces
   # beacon, the public delegation; document-wide the issuer PeerID, its raw
   # key, the issue time, a TTL, and the issuer's Ed25519 signature over the
   # canonical bytes: every field but signature, in declared order, map keys
-  # sorted, no whitespace, exactly as Jackson writes them. A reader ignores
-  # unknown fields. The document never carries a content key, a credential,
-  # or a membership hint. A document is a Hash with String keys, as JSON
-  # parses it.
+  # sorted, no whitespace, exactly as Jackson writes them. A signed document
+  # arrives as exactly its canonical JSON, signature last (HLC round seven,
+  # 2026-11-08); a reader ignores unknown fields of an unsigned one. The
+  # document never carries a content key, a credential, or a membership
+  # hint. A document is a Hash with String keys, as JSON parses it.
   module Beacon
     # A document, a group, or a founding the reader refuses (Python's ValueError).
     class Error < ArgumentError; end
@@ -179,7 +180,7 @@ module AgentSpaces
     # The bytes the signature covers: every known field but signature, in
     # declared order (v, issuer, issuerKey, issued, ttl, groups), nil fields
     # omitted, map keys sorted, no whitespace. Returns a binary String.
-    def canonical_bytes(doc) = jackson_json(canonical_body(doc))
+    def canonical_bytes(doc) = jackson_json(canonical_body(doc), true)
 
     # BeaconDocument.signed: a document issued and signed by issuer.
     def sign_document(issuer, issued_iso, ttl_seconds, groups)
@@ -190,11 +191,13 @@ module AgentSpaces
     end
 
     # The document as one line of JSON, signature last (Python's to_json;
-    # named so it does not shadow Object#to_json). Returns a binary String.
+    # named so it does not shadow Object#to_json): Java's toBytes, which
+    # Jackson's text writer writes, so a code point past U+FFFF stays as it
+    # is. Returns a binary String.
     def document_json(doc)
       body = canonical_body(doc)
-      body["signature"] = doc["signature"] unless doc["signature"].nil?
-      jackson_json(body)
+      body["signature"] = text_field(doc["signature"], "signature") unless doc["signature"].nil?
+      jackson_json(body, false)
     end
 
     # BeaconDocument.signer: the PeerID the carried key hashes to, when it
@@ -282,15 +285,48 @@ module AgentSpaces
              Net::ProtocolError => e
         raise FetchError, "GET #{url}: #{e.message}"
       end
+      doc = begin
+        parse_document(body)
+      rescue Error => e
+        raise Error, "GET #{url}: #{e.message}"
+      end
+      verify_document(doc, beacon_peer, allow_unsigned: allow_unsigned)
+      doc
+    end
+
+    # The document the JSON bytes body hold. An unsigned document reads
+    # leniently in form, with whitespace, any member order, and unknown
+    # members, while every member it names holds its Java type, signed or not
+    # (SPEC v0.1.32 9.3, 2026-11-09): a group name sent as a number or a ttl
+    # sent as text refuses it, as Java's reader refuses it. A document that
+    # carries a signature must be exactly its canonical JSON, document_json of
+    # what it decodes to, as Java's
+    # BeaconDocument.parse requires (HLC round seven, 2026-11-08, owner ruling
+    # F3 applied to the beacon document): the signature covers
+    # canonical_bytes, which are then the bytes received less the signature
+    # member, so whitespace, another member order, an unknown or repeated
+    # member, another escape, or a number in another form refuses the
+    # document instead of relabelling it. Raises Beacon::Error otherwise.
+    def parse_document(body)
       text = body.dup.force_encoding(Encoding::UTF_8)
-      raise Error, "GET #{url}: not a JSON document" unless text.valid_encoding?
+      raise Error, "not a JSON document" unless text.valid_encoding?
 
       doc = begin
         JSON.parse(text, allow_nan: true, allow_duplicate_key: true)
       rescue JSON::ParserError
-        raise Error, "GET #{url}: not a JSON document"
+        raise Error, "not a JSON document"
       end
-      verify_document(doc, beacon_peer, allow_unsigned: allow_unsigned)
+      raise Error, "not a beacon document" unless doc.is_a?(Hash)
+
+      refuse_malformed_groups(doc)
+      canonical_body(doc)
+      if !doc["signature"].nil? && document_json(doc).b != body.b
+        raise Error, "a signed beacon document is not its canonical JSON"
+      end
+      if !doc["signature"].nil? && !(canonical_base64?(doc["signature"]) && canonical_base64?(doc["issuerKey"]))
+        raise Error, "a signed beacon document's signature or key is not canonical base64"
+      end
+
       doc
     end
 
@@ -332,12 +368,11 @@ module AgentSpaces
       founding = group["founding"]
       return nil if falsy?(founding)
 
-      signed = begin
-        CBOR.load(Base64Text.decode(founding))
+      begin
+        Schema.load("SignedGroupAdvertisement", Base64Text.decode(founding))
       rescue ArgumentError, TypeError
-        raise Error, "the founding of #{group['name'].inspect} is not base64 CBOR"
+        raise Error, "the founding of #{group['name'].inspect} is not a SignedGroupAdvertisement in base64 CBOR"
       end
-      signed.is_a?(Hash) ? signed : nil
     end
 
     # The GroupID the group's founding verifies to (the four checks of SPEC
@@ -459,135 +494,148 @@ module AgentSpaces
       body
     end
 
-    def canonical_body(doc)
-      body = { "v" => int_or_zero(doc["v"]) }
-      %w[issuer issuerKey issued].each { |key| body[key] = doc[key] unless doc[key].nil? }
-      body["ttl"] = int_or_zero(doc["ttl"])
+    # What Java's Group record refuses in a document signed or not: a group
+    # that is no object or has no name, a seed that is no object, and a
+    # parameter by a forbidden name (HLC round seven, 2026-11-08).
+    def refuse_malformed_groups(doc)
       groups = doc["groups"]
-      groups = [] if falsy?(groups)
-      raise TypeError, "groups is not a list" unless groups.is_a?(Array)
+      (groups.is_a?(Array) ? groups : []).each do |group|
+        raise Error, "not a beacon document: a group is no object with a name" unless group.is_a?(Hash) && !group["name"].nil?
+
+        seeds = group["seeds"]
+        raise Error, "not a beacon document: a seed is no object" if seeds.is_a?(Array) && !seeds.all?(Hash)
+
+        parameters = group["parameters"]
+        if parameters.is_a?(Hash) && parameters.keys.any? { |key| FORBIDDEN_PARAMETERS.include?(key.to_s.downcase) }
+          raise Error, "a beacon document never carries a secret"
+        end
+      end
+    end
+
+    # Java's field types: an int (v, a seed's priority, a wire hint) and a
+    # long (ttl).
+    JAVA_INT = (-(1 << 31)..(1 << 31) - 1).freeze
+    JAVA_LONG = (-(1 << 63)..(1 << 63) - 1).freeze
+
+    # Every known field but signature, in declared order (v, issuer,
+    # issuerKey, issued, ttl, groups), nil fields omitted, each of its Java
+    # type or a Beacon::Error (HLC round seven, 2026-11-08).
+    def canonical_body(doc)
+      body = { "v" => java_integer(doc["v"], JAVA_INT, "v") }
+      %w[issuer issuerKey issued].each { |key| body[key] = text_field(doc[key], key) unless doc[key].nil? }
+      body["ttl"] = java_integer(doc["ttl"], JAVA_LONG, "ttl")
+      groups = doc["groups"].nil? ? [] : doc["groups"]
+      raise Error, "groups are a list" unless groups.is_a?(Array)
 
       body["groups"] = groups.map { |group| canonical_group(group) }
       body
     end
 
     def canonical_group(group)
-      raise TypeError, "a group is not an object" unless group.is_a?(Hash)
+      raise Error, "a group is an object with a name" unless group.is_a?(Hash) && group["name"].is_a?(String)
 
       out = { "name" => group["name"] }
-      %w[id founding].each { |key| out[key] = group[key] unless group[key].nil? }
-      seeds = group["seeds"]
-      seeds = [] if falsy?(seeds)
-      raise TypeError, "seeds is not a list" unless seeds.is_a?(Array)
+      %w[id founding].each { |key| out[key] = text_field(group[key], key) unless group[key].nil? }
+      seeds = group["seeds"].nil? ? [] : group["seeds"]
+      raise Error, "seeds are a list of objects" unless seeds.is_a?(Array) && seeds.all?(Hash)
 
       out["seeds"] = seeds.map do |seed|
-        raise TypeError, "a seed is not an object" unless seed.is_a?(Hash)
-
-        { "transport" => seed["transport"], "address" => seed["address"],
-          "priority" => int_or_zero(seed["priority"]) }
+        { "transport" => text_field(seed["transport"], "transport"), "address" => text_field(seed["address"], "address"),
+          "priority" => java_integer(seed["priority"], JAVA_INT, "priority") }
       end
       unless group["wire"].nil?
-        out["wire"] = group["wire"].to_h.sort_by { |k, _| k.to_s }.to_h { |k, v| [k, py_int(v)] }
+        out["wire"] = sorted_map(group["wire"], "wire") { |v, what| v.nil? ? nil : java_integer(v, JAVA_INT, what) }
       end
-      out["multicast"] = group["multicast"] unless group["multicast"].nil?
-      out["parameters"] = group["parameters"].to_h.sort_by { |k, _| k.to_s }.to_h unless group["parameters"].nil?
-      out["invite"] = group["invite"] unless group["invite"].nil?
+      out["multicast"] = text_field(group["multicast"], "multicast") unless group["multicast"].nil?
+      out["parameters"] = sorted_map(group["parameters"], "parameters") { |v, what| text_field(v, what) } unless group["parameters"].nil?
+      out["invite"] = text_field(group["invite"], "invite") unless group["invite"].nil?
       out
     end
 
-    # Jackson's compact JSON as the Python twin writes it: no whitespace,
-    # non-ASCII unescaped, control characters as short escapes or upper-case
-    # \u00XX. Python upper-cases every "\u00xx" run of the encoded text,
-    # including one that follows an escaped backslash (a literal "«"
-    # in a value); this does the same so the signed bytes stay identical.
-    def jackson_json(value)
-      text = +""
-      write_json(value, text)
-      text.gsub(/\\u00([0-9a-f]{2})/) { "\\u00#{Regexp.last_match(1).upcase}" }.b
+    # A JSON integer the Java field holds; nil reads as Java's default 0.
+    def java_integer(value, range, what)
+      return 0 if value.nil?
+      raise Error, "#{what} is no integer a Java #{range == JAVA_INT ? 'int' : 'long'} holds" unless
+        value.is_a?(Integer) && range.cover?(value)
+
+      value
+    end
+
+    def text_field(value, what)
+      raise Error, "#{what} is not text" unless value.nil? || value.is_a?(String)
+
+      value
+    end
+
+    # A Map<String, X> as Jackson's ORDER_MAP_ENTRIES_BY_KEYS writes it: keys
+    # in String.compareTo order, UTF-16 code units.
+    def sorted_map(map, what)
+      raise Error, "#{what} is not an object" unless map.is_a?(Hash)
+
+      map.keys.sort_by { |key| Wire.java_order(key) }.to_h { |key| [key, yield(map[key], "#{what}.#{key}")] }
+    end
+
+    # Whether text is absent or the padded standard base64 of its bytes.
+    def canonical_base64?(text)
+      text.nil? || (text.is_a?(String) && [text.unpack1("m0")].pack("m0") == text)
+    rescue ArgumentError
+      false
+    end
+
+    # Jackson's compact JSON of the canonical body: no whitespace, members in
+    # the order built. The signed bytes come from Jackson's byte writer, which
+    # writes each UTF-16 surrogate as an upper-case \uXXXX escape.
+    def jackson_json(value, signed)
+      out = +""
+      write_json(value, out, signed)
+      out.b
     end
 
     JSON_ESCAPES = { '"' => '\\"', "\\" => "\\\\", "\n" => "\\n", "\r" => "\\r", "\t" => "\\t", "\b" => "\\b",
                      "\f" => "\\f" }.freeze
 
-    def write_json(value, out)
+    def write_json(value, out, signed)
       case value
       when nil then out << "null"
-      when true then out << "true"
-      when false then out << "false"
       when Integer then out << value.to_s
-      when Float
-        raise ArgumentError, "out of range float values are not JSON compliant" if value.nan? || value.infinite?
-
-        out << python_float(value)
-      when String, Symbol then write_json_string(value.to_s, out)
+      when String then write_json_string(value, out, signed)
       when Array
         out << "["
         value.each_with_index do |item, i|
           out << "," if i.positive?
-          write_json(item, out)
+          write_json(item, out, signed)
         end
         out << "]"
-      when Hash
+      else
         out << "{"
         value.each_with_index do |(key, item), i|
           out << "," if i.positive?
-          write_json_string(json_key(key), out)
+          write_json_string(key, out, signed)
           out << ":"
-          write_json(item, out)
+          write_json(item, out, signed)
         end
         out << "}"
-      else
-        raise TypeError, "#{value.class} is not JSON serializable"
       end
     end
 
-    def write_json_string(text, out)
+    # A string as Jackson writes it: the quote, the backslash and the short
+    # escapes, any other control character as upper-case \u00XX, and past
+    # U+FFFF, in the signed bytes, the two surrogates escaped.
+    def write_json_string(text, out, signed)
       utf8 = text.encoding == Encoding::UTF_8 ? text : text.dup.force_encoding(Encoding::UTF_8)
-      raise ArgumentError, "a JSON string is not valid UTF-8" unless utf8.valid_encoding?
+      raise Error, "a JSON string is not valid UTF-8" unless utf8.valid_encoding?
 
+      pattern = signed ? /["\\\x00-\x1f]|[^\u0000-\uffff]/ : /["\\\x00-\x1f]/
       out << '"'
-      out << utf8.gsub(/["\\\x00-\x1f]/) { |c| JSON_ESCAPES[c] || format("\\u%04x", c.ord) }
-      out << '"'
-    end
-
-    # json.dumps keys: text as is; numbers, booleans and null by their JSON text.
-    def json_key(key)
-      case key
-      when String, Symbol then key.to_s
-      when nil then "null"
-      when true, false then key.to_s
-      when Float then python_float(key)
-      else key.to_s
-      end
-    end
-
-    # Python's float repr: the shortest round-trip digits (Ruby's), written
-    # fixed when the decimal exponent lies in [-4, 16) and as "1.5e+16"
-    # otherwise. Built from the digits alone, because MRI and JRuby print
-    # large floats differently.
-    def python_float(value)
-      return value.to_s if value.zero?
-
-      m = value.abs.to_s.match(/\A(\d+)(?:\.(\d+))?(?:e([+-]?\d+))?\z/i)
-      digits = m[1] + m[2].to_s
-      point = m[1].size + m[3].to_i
-      lead = digits[/\A0*/].size
-      digits = digits[lead..]
-      point -= lead
-      digits = digits.sub(/0+\z/, "")
-      digits = "0" if digits.empty?
-      exponent = point - 1
-      text =
-        if exponent >= -4 && exponent < 16
-          if point <= 0 then "0.#{'0' * -point}#{digits}"
-          elsif point >= digits.size then "#{digits}#{'0' * (point - digits.size)}.0"
-          else "#{digits[0...point]}.#{digits[point..]}"
-          end
+      out << utf8.gsub(pattern) do |c|
+        if JSON_ESCAPES.key?(c) then JSON_ESCAPES[c]
+        elsif c.ord < 0x20 then format("\\u%04X", c.ord)
         else
-          mantissa = digits.size > 1 ? "#{digits[0]}.#{digits[1..]}" : digits
-          "#{mantissa}e#{exponent.negative? ? '-' : '+'}#{exponent.abs.to_s.rjust(2, '0')}"
+          code = c.ord - 0x10000
+          format("\\u%04X\\u%04X", 0xD800 + (code >> 10), 0xDC00 + (code & 0x3FF))
         end
-      value.negative? ? "-#{text}" : text
+      end
+      out << '"'
     end
 
     # Python truthiness for the values a JSON document carries.
@@ -614,7 +662,7 @@ module AgentSpaces
     # int(value or 0), the reading the canonical form gives v, ttl, and priority.
     def int_or_zero(value) = falsy?(value) ? 0 : py_int(value)
 
-    private_class_method :get_once, :read_capped, :canonical_body, :canonical_group, :write_json, :write_json_string,
-                         :json_key, :python_float
+    private_class_method :get_once, :read_capped, :canonical_body, :canonical_group, :java_integer, :text_field,
+                         :sorted_map, :canonical_base64?, :refuse_malformed_groups, :jackson_json, :write_json, :write_json_string
   end
 end

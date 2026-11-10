@@ -299,15 +299,17 @@ module AgentSpaces
     end
 
     # The Delegation record a delegation string carries, in declared field
-    # order. Raises Social::Error when the string is not a delegation.
+    # order. Raises Social::Error when the string is not a delegation: a
+    # JoinCredentials.Delegation in the wire encoding (HLC round six,
+    # 2026-11-08, F3) whose keys, signature, and group are present.
     def decode_delegation(delegation)
       parsed = begin
-        CBOR.load(Base64Text.decode(delegation.strip))
+        Schema.load("JoinCredentials.Delegation", Base64Text.decode(delegation.strip))
       rescue StandardError
         raise Error, "not a delegation string"
       end
-      unless parsed.is_a?(Hash) && bytes?(parsed["founderKey"]) && bytes?(parsed["inviteKey"]) &&
-             bytes?(parsed["signature"]) && text?(parsed["group"]) && parsed["notAfterMillis"].is_a?(Integer)
+      unless bytes?(parsed["founderKey"]) && bytes?(parsed["inviteKey"]) && bytes?(parsed["signature"]) &&
+             text?(parsed["group"])
         raise Error, "not a delegation string"
       end
 
@@ -344,11 +346,11 @@ module AgentSpaces
                                                        credential.strip.start_with?(DELEGATED_PREFIX)
 
       parsed = begin
-        CBOR.load(Base64Text.decode(strip_prefix(credential.strip)))
+        Schema.load("JoinCredentials.DelegatedCredential", Base64Text.decode(strip_prefix(credential.strip)))
       rescue StandardError
         raise Error, "not a delegated credential"
       end
-      unless parsed.is_a?(Hash) && parsed["delegation"].is_a?(Hash) && bytes?(parsed["signature"])
+      unless parsed["delegation"].is_a?(Hash) && bytes?(parsed["signature"])
         raise Error, "not a delegated credential"
       end
 

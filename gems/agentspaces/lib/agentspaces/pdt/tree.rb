@@ -21,12 +21,19 @@ module AgentSpaces
   module PDT
     # The tree exchange over the content swarm (srad/agentspaces-pdt.md 3.5 and
     # 10.2; PD-X-01 to PD-X-06, PD-C-06): tags 8 to 11 inside
-    # aspace:cap/content-swarm pipe frames. The Ruby face is a fetcher only: it
-    # asks NODE_WANT and TREE_WANT of members whose newest content-swarm
-    # advertisement carries trees = "1", verifies every node against a CID it
-    # asked for or reached through a verified parent, drops an unsolicited
-    # answer, and strikes a sender whose node matches nothing. It serves no
-    # node: a dial-only peer holds nothing a holder cannot serve better.
+    # aspace:cap/content-swarm pipe frames. The fetcher asks NODE_WANT and
+    # TREE_WANT of members whose newest content-swarm advertisement carries
+    # trees = "1", verifies every node against a CID it asked for or reached
+    # through a verified parent, drops an unsolicited answer, and strikes a
+    # sender whose node matches nothing.
+    #
+    # PDT 2 phase 7 (P2-X-06): the face also serves. It answers NODE_WANT with
+    # the nodes its store holds and names the rest missing, and TREE_WANT with a
+    # breadth-first walk under the asker's haves and budget closed by TREE_END,
+    # as Java's TreeServer does; it refuses a root it lacks with REJECT reason 1,
+    # and refuses by policy when the group seals nodes and it holds no content
+    # key. Once its Pdt writes a head it advertises trees = "1" and no pdt
+    # parameter, so it stays at PDT feature level 1 (P2-C-02).
     module Tree
       TYPE = "aspace:cap/content-swarm"
       NODE_WANT = 8
@@ -44,10 +51,34 @@ module AgentSpaces
       MAX_HAVES = 64
       MAX_TREE_BUDGET = 64 * 1024 * 1024
       MAX_FRONTIER = 1024
+      # PDT 2 phase 7 (P2-X-06): the most nodes one TREE_WANT walk reaches, and
+      # the levels a walk sends when it holds none of the asker's haves.
+      MAX_WALK_NODES = 100_000
+      LEVELS_WITHOUT_HAVES = 2
+      # The CBOR framing one node adds inside a NODES, and that of the message,
+      # its list, and a seal's nonce and tag, which the packer counts.
+      NODE_FRAMING_BYTES = 5
+      MESSAGE_FRAMING_BYTES = 33
+      REASON_NOT_HELD = 1
+      REASON_POLICY = 3
       SEALING_AAD_PREFIX = "aspace:pdt|"
       TREES_PARAMETER = "trees"
       TREES_VERSION = "1"
+      SEALING_NONE = "none"
       SEALING_GROUP_KEY = "group-key"
+      ADVERTISEMENT_TTL = "PT15M"
+      # The advertisement is published again at a third of its time to live.
+      ADVERTISE_EVERY = 300
+      # PDT 2 phase 1 (P2-X-09): the fields of each message this face reads,
+      # in the order Java's Messages records declare and write them (annex I);
+      # Java writes a null field as null, so every field is present.
+      FIELDS = { NODE_WANT => %w[t req cids], NODES => %w[t req nodes sealed epoch missing],
+                 TREE_WANT => %w[t req root haves budget sketch], TREE_END => %w[t req frontier reason],
+                 REJECT => %w[t root index reason] }.freeze
+      # The piece messages (tags 1 to 7), which this face leaves to the handler before it.
+      PIECE_TAGS = (1..7)
+      # The values a Java long holds, the type of NODES.epoch.
+      JAVA_LONG = (-(1 << 63)..((1 << 63) - 1))
 
       module_function
 
@@ -57,8 +88,11 @@ module AgentSpaces
         { "t" => NODES, "req" => Integer(req), "nodes" => nodes, "sealed" => sealed, "epoch" => epoch, "missing" => missing }
       end
 
-      def tree_want(req, root, haves, budget, sketch = nil)
-        { "t" => TREE_WANT, "req" => Integer(req), "root" => root, "haves" => haves, "budget" => Integer(budget), "sketch" => sketch }
+      # PDT 2 phase 0 (srad/agentspaces-pdt2.md 6.10.2, P2-C-02): this face
+      # stays at PDT feature level 1, so its TREE_WANT always carries a null
+      # sketch, the level-1 form, and it never reconciles by sketch.
+      def tree_want(req, root, haves, budget)
+        { "t" => TREE_WANT, "req" => Integer(req), "root" => root, "haves" => haves, "budget" => Integer(budget), "sketch" => nil }
       end
 
       def tree_end(req, frontier, reason) = { "t" => TREE_END, "req" => Integer(req), "frontier" => frontier.to_a, "reason" => Integer(reason) }
@@ -69,18 +103,36 @@ module AgentSpaces
         return "#{what} is not a list" unless value.is_a?(Array)
         return "#{what} names more than #{bound} cids" if value.size > bound
 
-        value.each { |c| return "#{what} carries a malformed cid" unless Cids.cid?(c) }
+        value.each { |c| return "#{what} carries a malformed cid" unless cid_text?(c) }
         nil
       end
 
-      # The first broken bound of a tree message (PD-X-02), or nil.
+      # A CID in its one canonical text form, a text string and never a byte string.
+      def cid_text?(value) = value.is_a?(String) && value.encoding != Encoding::BINARY && Cids.cid?(value)
+
+      def bytes?(value) = value.is_a?(String) && value.encoding == Encoding::BINARY
+
+      def int?(value) = value.is_a?(Integer) && Refs::JAVA_INT.cover?(value)
+
+      # The first broken bound of a tree message (PD-X-02), or nil. PDT 2
+      # phase 1 (P2-X-09): a message reads as its record's own encoding
+      # under its annex I schema, as Java's Messages.decode reads it through
+      # CborCodec.fromWire; CBOR.load already refused bytes that are not the
+      # wire encoding of what they decode to.
       def violation(msg)
         return "not a map" unless msg.is_a?(Hash)
 
         t = msg["t"]
-        return "req is not an integer" unless msg["req"].is_a?(Integer)
+        fields = FIELDS[t]
+        return "not a tree message: tag #{t}" if fields.nil?
+        return "fields #{msg.keys.inspect} are not #{fields.inspect} in order" unless msg.keys == fields
+        return "req is not a Java int" unless t == REJECT || int?(msg["req"])
 
         case t
+        when REJECT
+          return "root is not text" unless msg["root"].is_a?(String) && msg["root"].encoding != Encoding::BINARY
+
+          int?(msg["index"]) && int?(msg["reason"]) ? nil : "index or reason is not a Java int"
         when NODE_WANT
           return "a NODE_WANT names at least one cid" unless msg["cids"].is_a?(Array) && !msg["cids"].empty?
 
@@ -92,14 +144,17 @@ module AgentSpaces
           return "epoch is present exactly when sealed is" if sealed.nil? != msg["epoch"].nil?
 
           if !plain.nil?
-            return "nodes is not a list of byte strings" unless plain.is_a?(Array) && plain.all? { |n| n.is_a?(String) }
+            return "nodes is not a list of byte strings" unless plain.is_a?(Array) && plain.all? { |n| bytes?(n) }
             return "a NODES carries at most #{MAX_NODES_BYTES} bytes of nodes" if plain.sum(&:bytesize) > MAX_NODES_BYTES
-          elsif !sealed.is_a?(String) || sealed.bytesize > MAX_NODES_BYTES
+          elsif !bytes?(sealed) || sealed.bytesize > MAX_NODES_BYTES
             return "a NODES carries at most #{MAX_NODES_BYTES} sealed bytes"
+          elsif !JAVA_LONG.cover?(msg["epoch"]) || !msg["epoch"].is_a?(Integer)
+            return "epoch is not a Java long"
           end
           msg["missing"].nil? ? nil : cid_list(msg["missing"], MAX_WANT_CIDS, "missing")
         when TREE_WANT
-          return "root is not a cid" unless Cids.cid?(msg["root"])
+          return "root is not a cid" unless cid_text?(msg["root"])
+          return "sketch is not a byte string" unless msg["sketch"].nil? || bytes?(msg["sketch"])
 
           unless msg["haves"].nil?
             bad = cid_list(msg["haves"], MAX_HAVES, "haves")
@@ -115,12 +170,19 @@ module AgentSpaces
           return "unknown TREE_END reason" unless [END_DONE, END_BUDGET, END_HAVES_NOT_HELD, END_WALK_CAP].include?(msg["reason"])
 
           nil
-        else
-          "not a tree message: tag #{t}"
         end
       end
 
       def sealing_aad(recipient, req) = "#{SEALING_AAD_PREFIX}#{recipient}|#{req}".b
+
+      # Seals a node list (group-key mode): nonce || ciphertext || tag under AES-256-GCM with the AAD.
+      def seal_nodes(key, nodes, aad)
+        cipher = OpenSSL::Cipher.new("aes-256-gcm").encrypt
+        cipher.key = key
+        nonce = cipher.random_iv
+        cipher.auth_data = aad
+        nonce + cipher.update(CBOR.dump(nodes)) + cipher.final + cipher.auth_tag
+      end
 
       # Opens a sealed node list (group-key mode): nonce || ciphertext || tag under
       # AES-256-GCM with the AAD, trying each key; nil when none opens it.
@@ -160,6 +222,14 @@ module AgentSpaces
     class TreeFetch
       Request = Struct.new(:req, :source, :kind, :cids, :subtree, :sent_at)
 
+      # Swarm retries (ROBUSTNESS.md 10.3 E3): a missing answer benches its source for that CID
+      # alone, MISSING_BENCH seconds doubling with each such answer up to MISSING_BENCH_MAX, with a
+      # random spread; a source whose requests time out twice sits out SIT_OUT seconds; a request
+      # times out after the larger of the configured timeout and eight smoothed round trips.
+      MISSING_BENCH = 1.0
+      MISSING_BENCH_MAX = 16.0
+      SIT_OUT = 60.0
+
       attr_reader :root, :bare, :haves, :failure, :nodes_received, :bytes_received, :sources, :struck, :round_trips
 
       def initialize(trees, root, haves, prefer, timeout, bare: nil)
@@ -179,9 +249,12 @@ module AgentSpaces
         @frontier = []
         @in_flight = {}
         @outstanding = {}
-        @missing_at = Hash.new { |h, k| h[k] = Set.new }
+        @benched = Hash.new { |h, k| h[k] = {} }
         @dropped = Set.new
         @timeouts = Hash.new(0)
+        @srtt = {}
+        @sitting_out = {}
+        @stalled_since = nil
         @sources = []
         @tree_want_sent = false
         @outbox = []
@@ -211,6 +284,8 @@ module AgentSpaces
       end
 
       # Waits up to timeout seconds (the fetch's own by default) for completion; whether it completed.
+      # The deadline ends the caller's wait alone: the fetch goes on, and fails by itself only once no
+      # source has answered for its timeout (swarm retries, ROBUSTNESS.md 10.3 E3).
       def wait(timeout = nil)
         deadline = monotonic + (timeout || @timeout)
         until @done
@@ -222,7 +297,6 @@ module AgentSpaces
             @cv.wait(@lock, [0.05, deadline - now].min) if !@done && @outbox.empty?
           end
         end
-        with_lock { finish("timed out after #{@timeout}s (sources tried: #{@sources.inspect})") unless @done }
         complete?
       end
 
@@ -255,6 +329,9 @@ module AgentSpaces
             return
           end
           @round_trips += 1
+          rtt = monotonic - request.sent_at
+          @srtt[sender] = @srtt.key?(sender) ? (@srtt[sender] * 7 + rtt) / 8 : rtt
+          @timeouts[sender] = 0
           nodes.each do |data|
             if accept(request, data)
               @nodes_received += 1
@@ -269,7 +346,8 @@ module AgentSpaces
               return
             end
           end
-          Array(msg["missing"]).each { |c| @missing_at[sender] << c }
+          now = monotonic
+          Array(msg["missing"]).each { |c| lack(sender, c, now) }
           release(request) if request.kind == :node_want
           schedule
         end
@@ -327,7 +405,10 @@ module AgentSpaces
         @trees.finished(self)
       end
 
-      def live_sources = @sources.reject { |s| @dropped.include?(s) }
+      def live_sources
+        now = monotonic
+        @sources.reject { |s| @dropped.include?(s) || @sitting_out.fetch(s, 0) > now }
+      end
 
       def drop(source) = @dropped << source
 
@@ -339,13 +420,44 @@ module AgentSpaces
       def tick_locked(now)
         return if @done
 
-        stale = @outstanding.values.select { |r| now - r.sent_at > @trees.request_timeout }
+        stale = @outstanding.values.select { |r| now - r.sent_at > request_timeout(r.source) }
         stale.each do |r|
           release(r)
           @timeouts[r.source] += 1
-          drop(r.source) if @timeouts[r.source] >= 2
+          next if @timeouts[r.source] < 2
+
+          @timeouts[r.source] = 0
+          @sitting_out[r.source] = now + SIT_OUT
         end
-        schedule unless stale.empty?
+        schedule
+        return if @done
+
+        # nothing asked of anyone: every source lacks what is left, sits out, or there is none
+        if @outstanding.empty?
+          @stalled_since ||= now
+          finish("no source answered for #{@timeout}s (sources tried: #{@sources.inspect})") if now - @stalled_since > @timeout
+        else
+          @stalled_since = nil
+        end
+      end
+
+      def request_timeout(source)
+        srtt = @srtt[source]
+        srtt.nil? ? @trees.request_timeout : [@trees.request_timeout, 8 * srtt].max
+      end
+
+      def lacks?(source, cid, now)
+        bench = @benched[source][cid]
+        !bench.nil? && now < bench[0]
+      end
+
+      def lack(source, cid, now)
+        bench = (@benched[source][cid] ||= [0.0, 0])
+        return if now < bench[0]
+
+        bench[1] += 1
+        pause = [MISSING_BENCH_MAX, MISSING_BENCH * (2**(bench[1] - 1))].min
+        bench[0] = now + pause + rand * pause / 2
       end
 
       def complete_now?
@@ -356,12 +468,6 @@ module AgentSpaces
         end
       end
 
-      def unobtainable?
-        return false if @bare.nil?
-
-        live = live_sources
-        @bare.any? { |c| !@store.has?(c) && live.all? { |s| @missing_at[s].include?(c) } }
-      end
 
       def schedule
         return if @done
@@ -375,19 +481,16 @@ module AgentSpaces
         sources = live_sources
         if sources.empty?
           return finish("no member advertises the tree exchange (content-swarm parameter trees)") if @sources.empty?
+          return finish("every source refused or was struck (sources tried: #{@sources.inspect})") if (@sources - @dropped.to_a).empty?
 
-          return finish("every source refused, timed out, or was struck (sources tried: #{@sources.inspect})")
+          return # the sources that timed out sit out a while; the tick fails the fetch if none comes back
         end
-        return finish("not held by any source (sources tried: #{@sources.inspect})") if unobtainable?
 
+        now = monotonic
         if @bare.nil?
-          holder = sources.find { |s| !@missing_at[s].include?(@root) }
+          holder = sources.find { |s| !lacks?(s, @root, now) }
           if !@store.has?(@root)
-            unless @in_flight.key?(@root)
-              return finish("root #{@root} is not held by any source (sources tried: #{@sources.inspect})") if holder.nil?
-
-              send_node_want(holder, [@root])
-            end
+            send_node_want(holder, [@root]) unless @in_flight.key?(@root) || holder.nil?
           elsif !@tree_want_sent
             @tree_want_sent = true
             refresh_expected(@root)
@@ -407,14 +510,14 @@ module AgentSpaces
           sources.size.times do
             candidate = sources[i % sources.size]
             i += 1
-            next if batch.all? { |c| @missing_at[candidate].include?(c) }
+            next if batch.all? { |c| lacks?(candidate, c, now) }
 
             source = candidate
             break
           end
           next if source.nil?
 
-          send_node_want(source, batch.reject { |c| @missing_at[source].include?(c) })
+          send_node_want(source, batch.reject { |c| lacks?(source, c, now) })
         end
       end
 
@@ -476,15 +579,20 @@ module AgentSpaces
       end
     end
 
-    # The fetcher attached to a peer: the content-swarm pipe handler for tags 8
-    # to 11, the sources that advertise trees, and the fetches in flight.
+    # The tree exchange attached to a peer: the content-swarm pipe handler for
+    # tags 8 to 11, the sources that advertise trees, the fetches in flight, and
+    # (PDT 2 phase 7, P2-X-06) the holder side that serves this store's nodes.
     class Trees
       attr_reader :peer, :store, :request_timeout, :budget, :load_timeout, :stats
 
-      def initialize(peer, store, keys: {}, load_timeout: 10.0, request_timeout: 5.0, budget: Tree::MAX_TREE_BUDGET)
+      # keys: content keys by epoch (group-key); write_epoch: the epoch whose key seals what this face serves.
+      def initialize(peer, store, keys: {}, write_epoch: keys.keys.max, load_timeout: 10.0, request_timeout: 5.0,
+                     budget: Tree::MAX_TREE_BUDGET)
         @peer = peer
         @store = store
         @keys = keys
+        @write_epoch = write_epoch
+        @advertised_at = nil
         @load_timeout = load_timeout
         @request_timeout = request_timeout
         @budget = budget
@@ -544,6 +652,16 @@ module AgentSpaces
         !params.nil? && params[Tree::TREES_PARAMETER] == Tree::TREES_VERSION
       end
 
+      # Whether any member's current advertisement says the group seals nodes in transit (PD-P-03).
+      def group_seals?
+        now = @peer.now_ms
+        @peer.ads.each_value.any? do |e|
+          ad = e["ad"] || {}
+          e["type"] == "CapabilityAdvertisement" && ad["capabilityType"] == Tree::TYPE && e.fetch("expires", 0) > now &&
+            (ad["parameters"] || {})["sealing"] == Tree::SEALING_GROUP_KEY
+        end
+      end
+
       # The members tags 8 to 11 may go to, the preferred ones first.
       def sources(prefer = [])
         own = @peer.identity.peer_id
@@ -564,12 +682,49 @@ module AgentSpaces
         end.start
       end
 
-      # A bare batch: the nodes named, following no links.
+      # A bare batch: the nodes named, following no links; a load past its deadline joins the batch
+      # still in flight for the same nodes (swarm retries).
       def fetch_nodes(cids, prefer: [], timeout: nil)
         cids.each { |c| Cids.parse(c) }
-        f = TreeFetch.new(self, nil, [], prefer, timeout || @load_timeout, bare: cids.to_a)
-        @lock.synchronize { @fetches << f }
-        f.start
+        @lock.synchronize do
+          existing = @fetches.find { |f| f.bare == cids.to_a && !f.done? }
+          return existing if existing
+
+          f = TreeFetch.new(self, nil, [], prefer, timeout || @load_timeout, bare: cids.to_a)
+          @fetches << f
+          f
+        end.start
+      end
+
+      # Times out stale requests, asks benched sources again, and fails the fetches
+      # no source answers; renews the advertisement of a face that serves.
+      def tick
+        active_fetches.each(&:tick)
+        advertise if !@advertised_at.nil? && Process.clock_gettime(Process::CLOCK_MONOTONIC) - @advertised_at >= Tree::ADVERTISE_EVERY
+      end
+
+      # Advertises the tree exchange once, so members fetch this face's nodes (PDT 2 phase 7, P2-X-06).
+      def serve!
+        advertise if @advertised_at.nil?
+      end
+
+      # This face's content-swarm CapabilityAdvertisement, in Java field order: the
+      # tree exchange (trees = "1") and its sealing, and no pdt parameter, since the
+      # face stays at feature level 1 (P2-C-02); it serves no piece.
+      def describe
+        now = @peer.now_ms
+        id = @peer.identity.peer_id
+        { "id" => "aspace://#{@peer.group}/cap/content-swarm/#{id}", "issuer" => id, "group" => @peer.group,
+          "issued" => Instants.iso(now - (now % 1000)), "ttl" => Tree::ADVERTISEMENT_TTL, "capabilityType" => Tree::TYPE,
+          "version" => "0.1", "binding" => "pipe",
+          "parameters" => CBOR.canonical_map({ "sealing" => @keys.empty? ? Tree::SEALING_NONE : Tree::SEALING_GROUP_KEY,
+                                                Tree::TREES_PARAMETER => Tree::TREES_VERSION }),
+          "costHints" => {} }
+      end
+
+      def advertise
+        @peer.publish_ad("CapabilityAdvertisement", describe)
+        @advertised_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       end
 
       # The bytes of one node: the store, else a bare batch waited for (PD-V-06).
@@ -597,41 +752,154 @@ module AgentSpaces
         Tree.open_nodes(keys, msg["sealed"], Tree.sealing_aad(@peer.identity.peer_id, req))
       end
 
-      # Routes one content-swarm frame; true when it was a tree frame.
+      # Routes one content-swarm frame; false for a piece message, which the
+      # handler before this one reads. PDT 2 phase 1 (P2-X-09): any other
+      # frame that is not a message of this face's level in its record's own
+      # encoding is dropped, counted in treeMessagesDropped, and strikes
+      # nobody, as Java and TypeScript count it.
       def on_frame(sender, payload)
         msg = begin
           CBOR.load(payload)
         rescue CBOR::Error
-          return false
+          nil
         end
-        return false unless msg.is_a?(Hash)
+        t = msg["t"] if msg.is_a?(Hash)
+        return false if Tree::PIECE_TAGS.include?(t) && !(t == Tree::REJECT && msg["index"] == Tree::TREE_INDEX)
 
-        case msg["t"]
+        if (bad = Tree.violation(msg))
+          count(:tree_messages_dropped)
+          @peer.logger&.debug("pdt: dropped a content-swarm frame from #{sender}: #{bad}")
+          return true
+        end
+        case t
         when Tree::NODES, Tree::TREE_END
-          if (bad = Tree.violation(msg))
-            count(:tree_messages_dropped)
-            @peer.logger&.debug("pdt: dropped a tag #{msg['t']} frame from #{sender}: #{bad}")
-            return true
-          end
           f = @lock.synchronize { @by_req[msg["req"]] }
           return true if f.nil?
 
           msg["t"] == Tree::NODES ? f.on_nodes(sender, msg) : f.on_tree_end(sender, msg)
           true
-        when Tree::NODE_WANT, Tree::TREE_WANT
-          # A dial-only reader serves nothing: refuse by policy so the asker moves on.
-          count(:tree_requests_refused)
-          root = msg["t"] == Tree::TREE_WANT ? msg["root"] : Array(msg["cids"]).first
-          send_message(sender, Tree.reject(root, Tree::TREE_INDEX, 3)) if root.is_a?(String)
+        when Tree::NODE_WANT
+          serve_node_want(sender, msg)
+          true
+        when Tree::TREE_WANT
+          serve_tree_want(sender, msg)
           true
         when Tree::REJECT
-          return false unless msg["index"] == Tree::TREE_INDEX
-
           active_fetches.each { |f| f.on_reject(sender, msg) }
           true
-        else
-          false
         end
+      end
+
+      private
+
+      def refuse(sender, root, reason)
+        count(:tree_requests_refused)
+        send_message(sender, Tree.reject(root, Tree::TREE_INDEX, reason))
+      end
+
+      # Why this face cannot answer: the group seals and it holds no key for its write epoch.
+      def cannot_seal? = @keys.empty? ? group_seals? : !@keys.key?(@write_epoch)
+
+      # One NODES to an asker, sealed under the write epoch's key in group-key mode.
+      def send_nodes(to, req, batch, missing)
+        message = if @keys.empty?
+                    Tree.nodes_message(req, batch, nil, nil, missing)
+                  else
+                    sealed = Tree.seal_nodes(@keys.fetch(@write_epoch), batch, Tree.sealing_aad(to, req))
+                    Tree.nodes_message(req, nil, sealed, @write_epoch, missing)
+                  end
+        send_message(to, message)
+        @lock.synchronize do
+          @stats[:nodes_served] += batch.size
+          @stats[:bytes_served] += batch.sum(&:bytesize)
+        end
+      end
+
+      # Sends node bytes packed under the NODES bound, missing on the last message.
+      def packed(to, req, nodes, missing)
+        batch = []
+        size = Tree::MESSAGE_FRAMING_BYTES
+        nodes.each do |data|
+          if !batch.empty? && size + data.bytesize + Tree::NODE_FRAMING_BYTES > Tree::MAX_NODES_BYTES
+            send_nodes(to, req, batch, nil)
+            batch = []
+            size = Tree::MESSAGE_FRAMING_BYTES
+          end
+          batch << data
+          size += data.bytesize + Tree::NODE_FRAMING_BYTES
+        end
+        send_nodes(to, req, batch, missing)
+      end
+
+      def serve_node_want(sender, msg)
+        wanted = msg["cids"]
+        return refuse(sender, wanted.first, Tree::REASON_POLICY) if cannot_seal?
+
+        found = wanted.filter_map { |cid| @store.get(cid) }
+        missing = wanted.reject { |cid| @store.has?(cid) }
+        packed(sender, msg["req"], found, missing.empty? ? nil : missing)
+      end
+
+      # A breadth-first walk from the root that skips every node a held haves root
+      # reaches, stops at the budget or the walk cap, and closes with TREE_END and
+      # the frontier; when the asker names haves and this face holds none, the walk
+      # sends the top two levels and closes with END_HAVES_NOT_HELD (S3 of 6.4).
+      def serve_tree_want(sender, msg)
+        root = msg["root"]
+        return refuse(sender, root, Tree::REASON_POLICY) if cannot_seal?
+        return refuse(sender, root, Tree::REASON_NOT_HELD) unless @store.has?(root)
+
+        haves = (msg["haves"] || []).uniq - [root]
+        held = haves.select { |h| @store.has?(h) }
+        prune = Set.new
+        walked = 0
+        held.each do |h|
+          reach = @store.reachable(h)
+          walked += reach.size
+          prune.merge(reach)
+          break if walked >= Tree::MAX_WALK_NODES
+        end
+        two_levels = !haves.empty? && held.empty?
+        queue = [[root, 0]]
+        sent = Set.new
+        frontier = []
+        nodes = []
+        spent = 0
+        reason = Tree::END_DONE
+        until queue.empty?
+          cid, level = queue.first
+          if prune.include?(cid) || sent.include?(cid)
+            queue.shift
+            next
+          end
+          if two_levels && level >= Tree::LEVELS_WITHOUT_HAVES
+            frontier << queue.shift[0]
+            next
+          end
+          data = @store.get(cid)
+          if data.nil?
+            queue.shift
+            next
+          end
+          if spent + data.bytesize > msg["budget"] && !sent.empty?
+            reason = Tree::END_BUDGET
+            break
+          end
+          if walked >= Tree::MAX_WALK_NODES
+            reason = Tree::END_WALK_CAP
+            break
+          end
+          queue.shift
+          sent << cid
+          spent += data.bytesize
+          walked += 1
+          nodes << data
+          @store.links(cid, data).each { |link| queue << [link, level + 1] unless prune.include?(link) || sent.include?(link) }
+        end
+        reason = Tree::END_HAVES_NOT_HELD if two_levels && reason == Tree::END_DONE
+        packed(sender, msg["req"], nodes, nil)
+        rest = (frontier + queue.map(&:first)).uniq.reject { |c| sent.include?(c) || prune.include?(c) }
+        send_message(sender, Tree.tree_end(msg["req"], rest.first(Tree::MAX_FRONTIER), reason))
       end
     end
   end

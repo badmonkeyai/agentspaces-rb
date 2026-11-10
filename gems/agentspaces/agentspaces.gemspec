@@ -44,4 +44,7 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
   # Ruby 4.0 moved logger from the default gems to the bundled gems.
   spec.add_dependency "logger", ">= 1.5"
+  # The CBOR decoder reads Jackson's tag 4 as a BigDecimal (HLC round five,
+  # 2026-11-08 (E8)), and Ruby 3.4 moved bigdecimal to the bundled gems.
+  spec.add_dependency "bigdecimal", ">= 3.1"
 end

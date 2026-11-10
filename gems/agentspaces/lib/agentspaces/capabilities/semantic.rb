@@ -95,7 +95,13 @@ module AgentSpaces
           text
         when "AssetCard" then "#{ad['description']} #{ad['asset']} #{ad['uri']} #{ad['shape']}"
         when "ModelCard" then "#{ad['name']} #{ad['version']} #{Array(ad['tasks']).join(' ')} #{ad['modality']} #{ad['engine']} #{ad['licence']}"
-        when "AppCard" then "#{ad['name']} #{ad['kind']} #{ad['shape']} #{ad['owner']} #{ad['url']}"
+        when "AppCard"
+          # SPEC §6.1a.2 v0.1.32 (AppCard origin and formats, 2026-11-09): the
+          # origin and formats follow the url; a stub keeps every one inline.
+          text = "#{ad['name']} #{ad['kind']} #{ad['shape']} #{ad['owner']} #{ad['url']}"
+          text += " #{ad['origin']['system']} #{ad['origin']['ref']}" if ad["origin"]
+          text += " #{ad['formats'].join(' ')}" if ad["formats"]
+          text
         when "CapabilityAdvertisement"
           parameters = (ad["parameters"] || {}).map { |k, v| "#{k}=#{v}" }.join(", ")
           "#{ad['capabilityType']} #{ad['binding']} {#{parameters}}"
@@ -162,33 +168,35 @@ module AgentSpaces
         scored.sort_by { |score, index, _| [-score, index] }.map { |score, _, entry| [score, entry] }
       end
 
+      # HLC round seven, 2026-11-08: a query, else a response, as Java's
+      # fromWire reads each under its annex I schema and the canonical-bytes
+      # rule; anything else is dropped.
       def on_frame(sender, payload)
-        frame = begin
-          CBOR.load(payload)
-        rescue CBOR::Error
-          return
-        end
-        return unless frame.is_a?(Hash)
+        query = decode("SemanticDiscovery.SemQuery", payload)
+        return answer(sender, query) if query && query["text"].is_a?(String)
 
-        if frame["text"].is_a?(String)
-          answer(sender, frame)
-        elsif frame["hits"].is_a?(Array)
-          frame["hits"].each { |hit| @peer.accept_ad(hit) if hit.is_a?(Hash) && hit["adType"] }
-          nonce = frame.fetch("nonce", -1)
-          waiter = @lock.synchronize { @pending[nonce.is_a?(Numeric) ? Integer(nonce) : nonce] }
-          waiter&.push(true)
-        end
+        response = decode("SemanticDiscovery.SemResponse", payload)
+        return if response.nil? || response["hits"].nil?
+
+        response["hits"].each { |hit| @peer.accept_ad(hit) if hit["adType"] }
+        waiter = @lock.synchronize { @pending[response["nonce"]] }
+        waiter&.push(true)
+      end
+
+      def decode(record, payload)
+        Schema.load(record, payload)
+      rescue CBOR::Error
+        nil
       end
 
       def answer(sender, query)
-        limit = query.fetch("limit", 10)
-        limit = [[limit.is_a?(Numeric) ? Integer(limit) : 10, 16].min, 1].max
+        limit = query["limit"].clamp(1, 16)
         hits = ranked(query["text"]).first(limit).map do |_, entry|
           stored = entry["stored"]
           { "adType" => stored["adType"], "adBytes" => stored["adBytes"], "publicKey" => stored["publicKey"],
             "signature" => stored["signature"] }
         end
-        @pipes.send_pipe(sender, TYPE, CBOR.dump({ "nonce" => query.fetch("nonce", 0), "hits" => hits }))
+        @pipes.send_pipe(sender, TYPE, CBOR.dump({ "nonce" => query["nonce"], "hits" => hits }))
       end
     end
   end

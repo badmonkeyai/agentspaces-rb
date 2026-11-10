@@ -31,9 +31,12 @@ module AgentSpaces
       # Every invocable action the cached cards declare: a declared take
       # action with one consumed and one produced schema and a space, or, for
       # a card without declared actions, each (consumes, produces, binding) pair.
+      # A spilled card is resolved first, since its actions sit in its parts
+      # document; one this peer cannot resolve offers no action (AppCard
+      # origin and formats, 2026-11-09).
       def actions(peer)
         found = []
-        peer.cards.each do |card|
+        resolved_cards(peer).each do |card|
           declared = Array(card["actions"])
           unless declared.empty?
             declared.each do |a|
@@ -60,6 +63,16 @@ module AgentSpaces
         end
         found
       end
+
+      def resolved_cards(peer)
+        peer.cards.filter_map do |card|
+          peer.resolve(card)
+        rescue StandardError => e
+          peer.logger&.debug("remote actions: #{card['id']} stays a stub: #{e.message}")
+          nil
+        end
+      end
+      private_class_method :resolved_cards
 
       # Correlation.sharedFields: every field both carry is equal.
       def shared_fields?(input_payload, candidate)

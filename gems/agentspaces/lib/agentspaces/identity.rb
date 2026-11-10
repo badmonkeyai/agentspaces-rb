@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+require "date"
 require "fileutils"
 require "securerandom"
 
@@ -97,6 +98,31 @@ module AgentSpaces
       millis += fraction.ljust(9, "0")[0, 3].to_i if fraction
       millis
     end
+
+    # HLC round six, 2026-11-08 (P2): an Instant field holds exactly the text
+    # Java's DateTimeFormatter.ISO_INSTANT prints: a year from 0000 to 9999,
+    # a real date and time, and a fraction only when the nanoseconds are not
+    # zero, in the fewest of 3, 6, or 9 digits that hold them.
+    CANONICAL_INSTANT = /\A(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{3}|\d{6}|\d{9}))?Z\z/
+    # HLC round six, 2026-11-08 (P2): a Duration field holds exactly the text
+    # Java's Duration.toString prints for a non-negative duration: PT0S, or
+    # hours, minutes from 1 to 59, and seconds from 1 to 59 or a fraction,
+    # each only when not zero, a fraction with no trailing zero, no days.
+    CANONICAL_DURATION = /\APT(?:0S|(?=\d)(?:[1-9]\d*H)?(?:(?:[1-9]|[1-5]\d)M)?
+                          (?:(?:(?:[1-9]|[1-5]\d)(?:\.\d{0,8}[1-9])?|0\.\d{0,8}[1-9])S)?)\z/x
+
+    def canonical_instant?(text)
+      match = CANONICAL_INSTANT.match(text)
+      return false if match.nil?
+
+      year, month, day, hour, minute, second, fraction = match.captures
+      return false unless Date.valid_civil?(year.to_i, month.to_i, day.to_i, Date::GREGORIAN)
+      return false unless hour.to_i < 24 && minute.to_i < 60 && second.to_i < 60
+
+      fraction.nil? || !fraction.end_with?("000")
+    end
+
+    def canonical_duration?(text) = CANONICAL_DURATION.match?(text)
 
     # Epoch milliseconds as java.time.Instant prints them: whole seconds bare,
     # otherwise three fraction digits.
@@ -184,7 +210,10 @@ module AgentSpaces
 
   # Subordinate agent certificates (SPEC 4.2, 11a.3; TECH-SPEC 7.2).
   module Certificates
-    # How far a signing time may lead the receiver's clock (the HLC drift ceiling).
+    # The HLC drift ceiling: in the claim fold, how far a claim may predate
+    # its entry and how stale a contesting claim may be. An agent-signed
+    # state's signedAt meets the far-future rule instead (HLC round six,
+    # 2026-11-08 (F4)).
     MAX_DRIFT_MILLIS = 10 * 60 * 1000
 
     module_function
@@ -209,11 +238,15 @@ module AgentSpaces
       signing_ms >= issued && signing_ms < issued + Instants.parse_duration_millis(certificate["ttl"])
     end
 
-    # AgentCertificates.verifyAt: judged at the signing time of what it certifies.
-    def verify_at(certificate, peer_public_raw, expected_agent, signing_ms, receiver_now_ms)
+    # AgentCertificates.verifyCovering: judged at the signing time of the
+    # record or claim it certifies, which its window must cover, with no
+    # bound on how far that time leads the receiver's clock. The folds judge
+    # the stamp afterwards exactly as for a peer-signed carrier (HLC round
+    # five, 2026-11-08 (E4)), an agent-signed state's signedAt included (HLC
+    # round six, 2026-11-08 (F4)).
+    def verify_covering(certificate, peer_public_raw, expected_agent, signing_ms)
       return false unless certificate.is_a?(Hash)
       return false unless covers?(certificate, signing_ms)
-      return false if signing_ms > receiver_now_ms + MAX_DRIFT_MILLIS
 
       verify(certificate, peer_public_raw, expected_agent, signing_ms)
     rescue ArgumentError, TypeError, NoMethodError
@@ -369,8 +402,19 @@ module AgentSpaces
 
     def sign(message) = Crypto.port.sign(@private, message).b
 
-    # The AgentID string form: "<peerId>/<localName>".
-    def agent(local_name) = "#{@peer_id}/#{local_name}"
+    # The AgentID string form: "<peerId>/<localName>". The local name is
+    # non-empty and holds no "/" and no ":" (Java's AgentId grammar, HLC
+    # round six, 2026-11-08 (R5)), and nothing the node of an HLC stamp may
+    # not hold, so every stamp the agent signs decodes (HLC round four,
+    # 2026-11-08 (D6)).
+    def agent(local_name)
+      # HLC round five, 2026-11-08 (E11): the grammar check runs first, so a
+      # name in another encoding, or one holding a lone surrogate, raises
+      # ArgumentError before any comparison with UTF-8 text.
+      raise ArgumentError, "not an agent name: #{local_name.inspect}" unless Wire.local_name?(local_name)
+
+      "#{@peer_id}/#{local_name}"
+    end
 
     # PeerIdentity.subordinate: certifies a fresh (or given) agent key.
     def subordinate(local_name, issued_iso, ttl_iso = "PT1H", key: nil)

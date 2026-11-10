@@ -33,6 +33,8 @@ module AgentSpaces
     # ASF-004 bounds, mirroring ReplicatedSpace.
     MAX_CLAIM_EPOCH_JUMP = 1 << 20
     MAX_CLAIM_HOLD_MILLIS = 24 * 60 * 60 * 1000
+    # The values a Java long holds (HLC round five, 2026-11-08 (E8)).
+    JAVA_LONG = CBOR::LONG
     # How far ahead of this peer's wall clock a remote stamp may run (ASF-020/043).
     MAX_HLC_SKEW_MILLIS = 10 * 60 * 1000
     # HLC canonical stamps, 2026-11-08: how far past wall + MAX_HLC_SKEW_MILLIS
@@ -42,6 +44,13 @@ module AgentSpaces
     # its frames just past the bound; the filter drops and counts them as
     # skewed, where a Java receiver strikes nobody for them.
     HLC_SKEW_MARGIN_MILLIS = 5_000
+    # HLC round four, 2026-11-08 (D4): how far past wall + MAX_HLC_SKEW_MILLIS
+    # + HLC_SKEW_MARGIN_MILLIS a folded record, lease, or claim stamp waits as
+    # deferred. Such a state or claim neither merges nor counts, and a later
+    # offer merges it once the receiver's wall catches up, so an honest taker
+    # a hostile stamp dragged ahead is never refused. A stamp further past
+    # reads as hostile: refused and counted.
+    HLC_DEFER_WINDOW_MILLIS = 60 * 60 * 1000
     # HLC logical counter, 2026-11-08 (Rust team report): the largest logical
     # counter a remote stamp may carry. Every merge point refuses a stamp above
     # it, and the local clock carries into the next millisecond at it, so a
@@ -55,6 +64,13 @@ module AgentSpaces
     # counter lies above HLC_LOGICAL_LIMIT and at most this decodes, so a
     # signature over it verifies, and every merge point then refuses it.
     HLC_LOGICAL_DECODE_MAX = (2**31) - 1
+    # HLC round seven, 2026-11-08 (SPEC §9.1, S6): a stamp is one definite
+    # text of at most this many UTF-16 units, since Jackson writes a longer
+    # text only in chunks; a clock's node leaves room for the longest
+    # physical part (19 digits), the longest logical part (10 digits) and
+    # their two colons, so every stamp it issues fits.
+    HLC_MAX_STAMP_UNITS = CBOR::TEXT_CHUNK
+    HLC_MAX_NODE_UNITS = HLC_MAX_STAMP_UNITS - 31
     # HLC canonical stamps, 2026-11-08: the one stamp text every
     # implementation decodes. Physical and logical parts are "0" or a non-zero
     # ASCII digit followed by ASCII digits, with no sign, fraction, exponent,
@@ -64,45 +80,62 @@ module AgentSpaces
     # matches equals its re-encoding, so a signer's bytes and a reader's
     # stamp never differ.
     HLC_STAMP = /\A(0|[1-9][0-9]{0,18}):(0|[1-9][0-9]{0,9}):([^:\x00-\x1F\x7F]+)\z/
+    # HLC round four, 2026-11-08 (D6): the node part of HLC_STAMP alone.
+    HLC_NODE = /\A[^:\x00-\x1F\x7F]+\z/
     # ROBUSTNESS.md 3.3 and 3.4: the stale bound and the replay memory.
     MAX_FRAME_AGE_MILLIS = 5 * 60 * 1000
     FRAME_FILTER_CAPACITY = 4096
     RELAY_SIGNAL_CAPABILITY = "aspace:cap/relay-signal"
+    # The body record each envelope kind carries (HLC round six,
+    # 2026-11-08, appendix A of the wire encoding).
+    BODIES = {
+      "PING" => "Bodies.Ping", "PING_REQ" => "Bodies.PingReq", "ACK" => "Bodies.Ack", "RUMOR" => "Bodies.Rumor",
+      "DIGEST" => "Bodies.Digest", "PULL_RESP" => "Bodies.PullResp", "QUERY" => "DiscoveryService.AdQuery",
+      "QUERY_HIT" => "DiscoveryService.QueryHits", "BLOCK_WANT" => "BlockExchange.Want",
+      "BLOCK" => "BlockExchange.Block", "PIPE_DATA" => "CapabilityPipes.PipeFrame", "BATCH" => "Bodies.Batch",
+      "HAVE" => "Bodies.Have", "GRAFT" => "Bodies.Graft", "PRUNE" => "Bodies.Prune",
+      "RELAY_FRAME" => "Bodies.RelayFrame", "CHANNEL_HELLO" => "Bodies.ChannelHello",
+      "SESSION_HELLO" => "Bodies.SessionHello", "GROUP_AD" => "SignedGroupAdvertisement"
+    }.freeze
     HOPS = 6
 
     # Admits each verified frame once, fresh, judging its stamp in the order
     # of SPEC 9 as Java's PeerNode does (HLC canonical stamps, 2026-11-08).
-    # It drops each refusal silently and counts it:
-    # 1. refused, a stamp that does not decode (Wire.hlc_decode);
-    # 2. stale, a stamp older than MAX_FRAME_AGE_MILLIS;
-    # 3. replayed, a (sender, stamp) pair it has seen; the memory records
-    #    every fresh frame before the checks below, as Java's does;
-    # 4. skewed, a stamp past wall + MAX_HLC_SKEW_MILLIS by at most
-    #    HLC_SKEW_MARGIN_MILLIS, and ahead, a stamp further past it;
-    # 5. refused, a logical counter above HLC_LOGICAL_LIMIT.
+    # Wire.decode_frame has already refused a stamp that does not decode, and
+    # the reader counts that frame in Peer#malformed_frames (HLC round four,
+    # 2026-11-08 (D3)). The filter drops each refusal silently and counts it
+    # under the name of Java's PeerNode counter (HLC round four, 2026-11-08 (D5)):
+    # 1. stale (framesStale), a stamp older than MAX_FRAME_AGE_MILLIS;
+    # 2. replayed (framesReplayed), a (sender, stamp) pair it has seen; the
+    #    memory records every fresh frame before the checks below, as Java's does;
+    # 3. far_future_skewed (framesFarFutureSkewed), a stamp past
+    #    wall + MAX_HLC_SKEW_MILLIS by at most HLC_SKEW_MARGIN_MILLIS, and
+    #    far_future (framesFarFuture), a stamp further past it;
+    # 4. logical_refused (framesLogicalRefused), a logical counter above
+    #    HLC_LOGICAL_LIMIT.
     # A Ruby peer keeps no strikes, so these counts are its whole record.
     class FrameFilter
-      attr_reader :stale, :ahead, :skewed, :refused, :replayed
+      attr_reader :stale, :replayed, :far_future, :far_future_skewed, :logical_refused
 
       def initialize(capacity = FRAME_FILTER_CAPACITY)
         @seen = {}
         @capacity = capacity
         @stale = 0
-        @ahead = 0
-        @skewed = 0
-        @refused = 0
         @replayed = 0
+        @far_future = 0
+        @far_future_skewed = 0
+        @logical_refused = 0
         @lock = Mutex.new
       end
 
       def admit(env, now_ms)
         stamp = env["stamp"]
         decoded = Wire.hlc_decode(stamp)
+        # An envelope handed to the filter directly, past Wire.decode_frame,
+        # whose stamp does not decode (HLC round four, 2026-11-08 (D3)).
+        return false if decoded.nil?
+
         @lock.synchronize do
-          if decoded.nil?
-            @refused += 1
-            return false
-          end
           physical, logical = decoded
           if now_ms - physical > MAX_FRAME_AGE_MILLIS
             @stale += 1
@@ -118,23 +151,25 @@ module AgentSpaces
           @seen.shift if @seen.size > @capacity
           past = physical - now_ms - MAX_HLC_SKEW_MILLIS
           if past > HLC_SKEW_MARGIN_MILLIS
-            @ahead += 1
+            @far_future += 1
             return false
           end
           if past.positive?
-            @skewed += 1
+            @far_future_skewed += 1
             return false
           end
           if logical > HLC_LOGICAL_LIMIT
-            @refused += 1
+            @logical_refused += 1
             return false
           end
           true
         end
       end
 
+      # The counts under Java's PeerNode names (HLC round four, 2026-11-08 (D5)).
       def to_h
-        { "stale" => @stale, "ahead" => @ahead, "skewed" => @skewed, "refused" => @refused, "replayed" => @replayed }
+        { "framesStale" => @stale, "framesReplayed" => @replayed, "framesFarFuture" => @far_future,
+          "framesFarFutureSkewed" => @far_future_skewed, "framesLogicalRefused" => @logical_refused }
       end
     end
 
@@ -147,8 +182,17 @@ module AgentSpaces
       # one millisecond, so stamps after an observed remote stamp sort after it.
       # A counter at HLC_LOGICAL_LIMIT carries into the next millisecond, so the
       # clock never repeats a stamp and never sends a counter a receiver refuses
-      # (HLC logical counter, 2026-11-08 (Rust team report)).
+      # (HLC logical counter, 2026-11-08 (Rust team report)). It raises
+      # ArgumentError for a node outside the stamp grammar, so the peer never
+      # emits a stamp a receiver cannot decode (HLC round four, 2026-11-08 (D6)),
+      # and so it does for a node past HLC_MAX_NODE_UNITS (HLC round seven,
+      # 2026-11-08).
       def hlc_now(node, now_ms = nil)
+        raise ArgumentError, "not an HLC node: #{node.inspect}" unless hlc_node?(node)
+        if CBOR.utf16_units(node) > HLC_MAX_NODE_UNITS
+          raise ArgumentError, "an HLC node holds at most #{HLC_MAX_NODE_UNITS} UTF-16 units"
+        end
+
         wall = now_ms.nil? ? (Time.now.to_f * 1000).to_i : Integer(now_ms)
         physical, logical = @hlc_lock.synchronize do
           physical, logical = @hlc_state.fetch(node, [0, -1])
@@ -166,10 +210,19 @@ module AgentSpaces
         "#{physical}:#{logical}:#{node}"
       end
 
+      # Whether text is a node the stamp grammar admits: UTF-8 text, non-empty,
+      # with no colon and no control character (HLC round four, 2026-11-08 (D6)).
+      def hlc_node?(node)
+        node.is_a?(String) && [Encoding::UTF_8, Encoding::US_ASCII].include?(node.encoding) &&
+          node.valid_encoding? && HLC_NODE.match?(node)
+      end
+
       # The physical milliseconds of an HLC stamp string: its signing time.
-      # Raises ArgumentError for a stamp that does not decode. A signing time
-      # never reaches a clock, so it is not judged against HLC_LOGICAL_LIMIT,
-      # as Java reads a record's, claim's, or state's signedAt.
+      # Raises ArgumentError for a stamp that does not decode. Verification
+      # reads a signing time here, before any merge point judges the stamp
+      # against HLC_LOGICAL_LIMIT; a folded state's signedAt meets that limit
+      # after its signatures verify, as every other stamp does (HLC round
+      # four, 2026-11-08 (D1)).
       def hlc_physical(stamp)
         decoded = hlc_decode(stamp) or raise ArgumentError, "not a canonical HLC stamp: #{stamp.inspect}"
         decoded.first
@@ -180,10 +233,14 @@ module AgentSpaces
       # canonical grammar (HLC_STAMP) whose physical part fits a signed
       # 64-bit integer and whose logical part fits a signed 32-bit integer,
       # as Java's HlcTimestamp.parse reads it, and nil for anything else,
-      # a CBOR byte string included.
+      # a CBOR byte string included. HLC round six, 2026-11-08 (S3, S6):
+      # CBOR.load refuses a text under a longer head or in chunks it does not
+      # need, so every text it reads is in the one form a stamp takes. HLC
+      # round seven, 2026-11-08: a text past HLC_MAX_STAMP_UNITS travels only in
+      # Jackson's chunks, so it is no stamp, a pdt.issued included.
       def hlc_decode(stamp)
-        return nil unless stamp.is_a?(String) && [Encoding::UTF_8, Encoding::US_ASCII].include?(stamp.encoding)
-        return nil unless stamp.valid_encoding?
+        return nil unless stamp.instance_of?(String) && [Encoding::UTF_8, Encoding::US_ASCII].include?(stamp.encoding)
+        return nil unless stamp.valid_encoding? && CBOR.utf16_units(stamp) <= HLC_MAX_STAMP_UNITS
 
         match = HLC_STAMP.match(stamp)
         return nil if match.nil?
@@ -208,6 +265,46 @@ module AgentSpaces
       # point applies before it folds a remote stamp (HLC logical counter,
       # 2026-11-08 (Rust team report)).
       def hlc_acceptable?(stamp) = !hlc_parse(stamp).nil?
+
+      # HLC round four, 2026-11-08 (D4): where a folded record, lease, or
+      # claim stamp's physical part lies against the receiver's wall: nil at
+      # most HLC_SKEW_MARGIN_MILLIS past wall + MAX_HLC_SKEW_MILLIS, where it
+      # merges; :deferred at most HLC_DEFER_WINDOW_MILLIS further, where it
+      # waits uncounted; :hostile beyond, where it is refused and counted.
+      def hlc_far_future(physical, now_ms)
+        past = physical - now_ms - MAX_HLC_SKEW_MILLIS - HLC_SKEW_MARGIN_MILLIS
+        return nil unless past.positive?
+
+        past > HLC_DEFER_WINDOW_MILLIS ? :hostile : :deferred
+      end
+
+      # Whether text is an agent id in Java's AgentId grammar:
+      # <peerId>/<localName>, both parts non-empty, and no "/" and no ":" in
+      # the local name (HLC round four, 2026-11-08 (D2); HLC round five,
+      # 2026-11-08 (E3); HLC round six, 2026-11-08 (R5)). Java's AgentId
+      # takes every other character, a control character included, so a
+      # record naming such an agent decodes here as it does in Java. Only a
+      # CBOR text string is text: the decoder hands a byte string over as a
+      # binary String, and that never names an agent (HLC round five,
+      # 2026-11-08 (E10)).
+      def agent_id?(text)
+        return false unless text.is_a?(String) && [Encoding::UTF_8, Encoding::US_ASCII].include?(text.encoding)
+        return false unless text.valid_encoding?
+
+        peer, local = text.split("/", 2)
+        !peer.to_s.empty? && !local.to_s.empty? && !local.include?("/") && !local.include?(":")
+      end
+
+      # Whether text is a local name Identity#agent gives an agent: non-empty,
+      # with no "/" and no ":" (HLC round six, 2026-11-08 (R5)), and nothing
+      # the node of an HLC stamp may not hold (HLC round four, 2026-11-08
+      # (D6)), since the agent signs stamps under its id.
+      def local_name?(text) = hlc_node?(text) && !text.include?("/")
+
+      # A verified envelope's body, decoded under its kind's record when the
+      # receiver needs it (HLC round six, 2026-11-08, F3 step 3). Raises
+      # CBOR::Error for a body that does not hold to it, an undecodable frame.
+      def decode_body(kind, body) = Schema.load(BODIES.fetch(kind) { raise CBOR::Error, "no body for #{kind}" }, body)
 
       # A stamp as a comparable [physical, logical, node]; raises
       # ArgumentError for a stamp the strict parser refuses, so no ordering
@@ -275,13 +372,18 @@ module AgentSpaces
       # A session frame (no key, a 32-byte tag) is accepted on the connection
       # whose session names its sender when the tag verifies; a hello is
       # accepted only fully signed (SPEC 5.6).
+      #
+      # HLC round six, 2026-11-08 (F3): the frame's items first (CBOR.load,
+      # which also proves the bytes re-encode to themselves), then the
+      # version, then the WireCodec.Signed and Envelope schemas, whose stamp
+      # must decode (HLC round four, 2026-11-08 (D3)), then the signature
+      # over the envelope's encoding, which equals the bytes received.
       def decode_frame_detailed(frame, attested: nil, session: nil)
         signed = CBOR.load(frame)
-        return nil unless signed.is_a?(Hash)
+        return nil unless signed.is_a?(Hash) && signed["envelope"].is_a?(Hash) && signed["envelope"]["ver"] == VERSION
 
+        Schema.check("WireCodec.Signed", signed)
         env = signed["envelope"]
-        return nil unless env.is_a?(Hash)
-        return nil unless env["ver"].is_a?(Integer) && env["ver"] == VERSION
 
         key = signed["senderPublicKey"]
         signature = signed["signature"]
@@ -302,7 +404,7 @@ module AgentSpaces
         return nil unless signature.is_a?(String) && Crypto.port.verify(key, CBOR.dump(env), signature)
 
         [env, :signed]
-      rescue CBOR::Error, ArgumentError, TypeError, EncodingError
+      rescue ArgumentError, TypeError, EncodingError
         nil
       end
 
@@ -316,7 +418,8 @@ module AgentSpaces
         CBOR.dump({ "streamId" => stream_id, "itemId" => item_id, "hopsRemaining" => hops, "payload" => payload.b })
       end
 
-      def digest_body(digests) = CBOR.dump({ "digests" => digests })
+      # HLC round six, 2026-11-08 (P2): the digests map in the RFC 8949 order.
+      def digest_body(digests) = CBOR.dump({ "digests" => CBOR.canonical_map(digests) })
 
       # Bodies.ChannelHello: this node accepts channel-attested frames on a
       # connection whose remote end it attested as attested_remote.
@@ -415,8 +518,10 @@ module AgentSpaces
       end
 
       # TECH-SPEC 7.2's record rule: peer-signed, or agent-signed under a
-      # peer certificate judged at the record's own issue stamp.
-      def verify_record(record, issuer_public_raw, certificate, now_ms)
+      # peer certificate judged at the record's own issue stamp. The
+      # certificate bounds nothing past its own window; the folds judge how
+      # far ahead the stamp runs (HLC round five, 2026-11-08 (E4)).
+      def verify_record(record, issuer_public_raw, certificate)
         return false unless issuer_public_raw.is_a?(String) && issuer_public_raw.bytesize == 32
 
         issuer = record["issuer"]
@@ -429,14 +534,17 @@ module AgentSpaces
         return Crypto.port.verify(issuer_public_raw, view, signature) if certificate.nil?
 
         signed_at = hlc_physical(record["issued"])
-        return false unless Certificates.verify_at(certificate, issuer_public_raw, issuer, signed_at, now_ms)
+        return false unless Certificates.verify_covering(certificate, issuer_public_raw, issuer, signed_at)
 
         Crypto.port.verify(certificate["agentPublicKey"], view, signature)
       rescue ArgumentError, TypeError
         false
       end
 
-      def sorted_dots(dots) = dots.sort_by { |d| [d["replica"].to_s, d["counter"].to_i] }
+      # The dots of a StateSignView in ReplicatedSpace.sortedDots order: by
+      # replica in Java's String.compareTo order, UTF-16 code units, then by
+      # counter (HLC round six, 2026-11-08, section 3.2; vector delta-13).
+      def sorted_dots(dots) = dots.sort_by { |d| [java_order(d["replica"]), d["counter"].to_i] }
 
       # ReplicatedSpace's StateSignView (SPEC 11a); an agent-signed state
       # appends signer and signedAt.
@@ -450,7 +558,9 @@ module AgentSpaces
         view
       end
 
-      # Signs a state DTO's mutable fields as its actor and returns the DTO.
+      # Signs a state DTO's mutable fields as its actor and returns the DTO
+      # in EntryStateDto field order, the order a strict receiver reads (HLC
+      # round six, 2026-11-08 (P1)).
       def sign_state(dto, identity, agent = nil, now_ms = nil)
         record = dto["record"] || {}
         signer = signed_at = certificate = nil
@@ -463,16 +573,17 @@ module AgentSpaces
         view = state_sign_view(record["spaceId"], record["entryId"], dto["adds"] || [], dto["removes"] || [],
                                dto["leaseStamp"], dto["leaseValue"], dto["completed"] ? true : false, signer,
                                signed_at)
-        signed = dto.reject { |k, _| %w[stateSig stateCertificate signer signedAt].include?(k) }
+        signed = {}
+        signed["record"] = dto["record"] unless dto["record"].nil?
+        %w[issuerPublicKey adds removes leaseStamp leaseValue completed].each { |k| signed[k] = dto[k] }
         signed["stateSig"] = (agent || identity).sign(CBOR.dump(view))
-        # EntryStateDto field order: ... stateSig, agentCertificate,
-        # stateCertificate, signer, signedAt; the v0.1.13 fields omitted when absent.
-        signed["agentCertificate"] = signed.delete("agentCertificate") if signed.key?("agentCertificate")
+        signed["agentCertificate"] = dto["agentCertificate"] unless dto["agentCertificate"].nil?
         unless agent.nil?
           signed["stateCertificate"] = certificate
           signed["signer"] = signer
           signed["signedAt"] = signed_at
         end
+        signed["entryId"] = dto["entryId"] unless dto["entryId"].nil?
         signed
       end
 
@@ -515,8 +626,9 @@ module AgentSpaces
           "bid" => Float(bid), "expiresAtMillis" => expires_at_millis }
       end
 
-      # A SignedClaim: the claim, the holder's peer key, the holder's signature;
-      # an agent's claim appends the certificate covering the claim's stamp.
+      # A SignedClaim: the claim (a TakeClaim in field order), the holder's
+      # peer key, the holder's signature over the claim's encoding; an
+      # agent's claim appends the certificate covering the claim's stamp.
       def signed_claim(claim, identity, agent = nil)
         signed = { "claim" => claim, "holderKey" => identity.public_raw,
                    "signature" => (agent || identity).sign(CBOR.dump(claim)) }
@@ -529,8 +641,13 @@ module AgentSpaces
         signed
       end
 
-      # TECH-SPEC 7.6's proof rule, as ReplicatedSpace.verifyClaim applies it.
-      def verify_claim_proof(signed, now_ms)
+      # TECH-SPEC 7.6's proof rule, as ReplicatedSpace.verifyClaim applies it:
+      # the signature covers the claim's encoding, which a received claim's
+      # schema proves equal to the bytes that arrived (HLC round six,
+      # 2026-11-08 (F3), superseding E13's re-ordering), and an agent
+      # certificate is judged at the claim's stamp within its own window,
+      # bounding nothing past it (E4).
+      def verify_claim_proof(signed)
         claim = signed["claim"]
         holder_key = signed["holderKey"]
         signature = signed["signature"]
@@ -541,12 +658,13 @@ module AgentSpaces
         return false unless holder.is_a?(String) && holder.start_with?("#{Derive.id(holder_key)}/")
 
         certificate = signed["holderCertificate"]
-        return Crypto.port.verify(holder_key, CBOR.dump(claim), signature) if certificate.nil?
+        view = CBOR.dump(claim)
+        return Crypto.port.verify(holder_key, view, signature) if certificate.nil?
 
         stamped = hlc_physical(claim["stamp"])
-        return false unless Certificates.verify_at(certificate, holder_key, holder, stamped, now_ms)
+        return false unless Certificates.verify_covering(certificate, holder_key, holder, stamped)
 
-        Crypto.port.verify(certificate["agentPublicKey"], CBOR.dump(claim), signature)
+        Crypto.port.verify(certificate["agentPublicKey"], view, signature)
       rescue ArgumentError, TypeError
         false
       end
@@ -557,9 +675,12 @@ module AgentSpaces
       # Epoch descending, bid ascending, HLC stamp ascending, holder
       # ascending, expiry descending; identical to TakeClaim.merge, strings
       # compared as Java compares them (HLC canonical stamps, 2026-11-08).
+      # HLC round six, 2026-11-08 (P2): bids order as Java's Double.compare
+      # orders them, so -0.0 sorts below 0.0 (vector claim-20).
       def claim_sort_key(claim)
-        [-Integer(claim.fetch("epoch", 0)), Float(claim.fetch("bid", 0.0)), hlc_order(claim["stamp"]),
-         java_order(claim.fetch("holder", "")), -Integer(claim.fetch("expiresAtMillis", 0))]
+        bid = claim["bid"]
+        [-claim["epoch"], bid, bid.zero? && (1.0 / bid).negative? ? 0 : 1, hlc_order(claim["stamp"]),
+         java_order(claim["holder"]), -claim["expiresAtMillis"]]
       end
 
       # Joins two signed claims. A side whose stamp the strict parser refuses
@@ -597,11 +718,23 @@ module AgentSpaces
 
       # A CardAction in Java field order: name, description, consumes,
       # produces, space (omitted when absent), kind.
-      def card_action(name, description, consumes, produces, kind, space = nil)
+      def card_action(name, description, consumes, produces, kind, space = nil, contract: nil)
         action = { "name" => name, "description" => description, "consumes" => consumes, "produces" => produces }
         action["space"] = space unless space.nil?
         action["kind"] = kind
+        action["contract"] = contract unless contract.nil?
         action
+      end
+
+      # A card action's contract (CardAction.Contract), or nil when every term
+      # is empty, so an empty contract never reaches the wire, as in Java.
+      def card_contract(pre, post, cost)
+        pre = Array(pre)
+        post = Array(post)
+        cost = cost.to_s
+        return nil if pre.empty? && post.empty? && cost.strip.empty?
+
+        { "pre" => pre, "post" => post, "cost" => cost, "methods" => [] }
       end
     end
   end

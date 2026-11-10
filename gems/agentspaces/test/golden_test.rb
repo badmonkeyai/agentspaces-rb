@@ -125,7 +125,7 @@ class GoldenTest < Minitest::Test
             "stateSig" => hex("state_signature"), "agentCertificate" => agent.certificate }
     assert_equal hex("entry_state_with_certificate_cbor"), cbor(dto)
     assert_equal hex("delta_with_certificate_cbor"), cbor({ "state" => dto, "claimEntry" => nil, "claim" => nil })
-    assert Wire.verify_record(record, identity.public_raw, agent.certificate, now)
+    assert Wire.verify_record(record, identity.public_raw, agent.certificate)
 
     # A6: that state is peer-signed on an agent-attested entry and refused;
     # the agent-signed state lands.
@@ -263,8 +263,8 @@ class GoldenTest < Minitest::Test
     assert_equal cbor(load(hex("claim_delta_cbor"))["claim"]), cbor(Wire.signed_claim(claim, identity))
     assert_equal hex("claim_delta_with_certificate_cbor"), Wire.claim_delta(ENTRY, signed)
     now = ms(GOLDEN["certificate_verify_at"])
-    assert Wire.verify_claim_proof(signed, now)
-    refute Wire.verify_claim_proof(signed.merge("holderCertificate" => nil), now)
+    assert Wire.verify_claim_proof(signed)
+    refute Wire.verify_claim_proof(signed.merge("holderCertificate" => nil))
   end
 
   def test_claim_lattice_order_matches_the_java_merge
@@ -287,7 +287,7 @@ class GoldenTest < Minitest::Test
                           record["issued"], key_epoch: 2)
     assert_equal hex("sign_view_key_epoch_cbor"), cbor(view)
     assert_equal hex("sign_view_key_epoch_cbor"), cbor(Wire.sign_view_of(record))
-    assert Wire.verify_record(record, identity.public_raw, nil, 0)
+    assert Wire.verify_record(record, identity.public_raw, nil)
     assert_equal "#{GOLDEN['space_id']}|#{record['entryId']}|2", GOLDEN["content_key_aad_epoch_2"]
     plain = load(hex("entry_state_dto_cbor"))["record"]
     assert_equal hex("sign_view_cbor"), cbor(Wire.sign_view_of(plain))
@@ -410,13 +410,23 @@ class GoldenTest < Minitest::Test
     assert_equal false, peer.states[ENTRY]["completed"]
   end
 
-  def test_a_state_signed_outside_its_window_or_beyond_the_drift_ceiling_is_refused
-    { "adv_agent_state_out_of_window_delta" => -3_600_000, "adv_agent_state_drift_delta" => 660_000 }.each do |n, off|
+  # HLC round five, 2026-11-08 (E4): a state signed outside its certificate's
+  # window never verifies and counts in no stamp counter. HLC round six,
+  # 2026-11-08 (F4): an agent-signed state's signedAt meets the far-future
+  # rule, so the drift vector (signedAt at t0 + 11 min, 55 s past the skew
+  # margin) waits as deferred, counted once, where the certificate's drift
+  # ceiling dropped it uncounted; the vector's label "refused" reads
+  # "deferred" under F4, and it merges once the receiver's wall catches up.
+  def test_a_state_signed_outside_its_window_is_refused_and_one_beyond_the_skew_margin_waits
+    { "adv_agent_state_out_of_window_delta" => [-3_600_000, 0],
+      "adv_agent_state_drift_delta" => [660_000, 1] }.each do |n, (off, deferred)|
       state = load(hex(n))["state"]
       assert_equal stamp(off), state["signedAt"], n
       peer = peer_at(GOLDEN["certificate_verify_at"])
       peer.fold_state(state)
       assert_empty peer.states, n
+      assert_equal [deferred, 0, 0], [peer.stamps_far_future_deferred, peer.stamps_far_future_refused,
+                                      peer.stamps_logical_refused], n
     end
     caught_up = peer_at(Wire.hlc_physical(GOLDEN["hlc_encoded"]) + 60_000)
     caught_up.fold_state(load(hex("adv_agent_state_drift_delta"))["state"])
@@ -427,7 +437,7 @@ class GoldenTest < Minitest::Test
     peer = peer_at(GOLDEN["certificate_verify_at"])
     delta = load(hex("adv_claim_cert_out_of_window_delta"))
     assert_equal stamp(-3_600_000), delta["claim"]["claim"]["stamp"]
-    refute Wire.verify_claim_proof(delta["claim"], ms(GOLDEN["certificate_verify_at"]))
+    refute Wire.verify_claim_proof(delta["claim"])
     peer.fold_claim(delta["claimEntry"], delta["claim"])
     assert_empty peer.claims
     control = load(hex("claim_delta_with_certificate_cbor"))
@@ -441,8 +451,8 @@ class GoldenTest < Minitest::Test
     genuine = load(hex("entry_record_key_epoch_cbor"))
     assert_equal 3, relabelled["keyEpoch"]
     assert_equal genuine["sig"], relabelled["sig"]
-    assert Wire.verify_record(genuine, identity.public_raw, nil, 0)
-    refute Wire.verify_record(relabelled, identity.public_raw, nil, 0)
+    assert Wire.verify_record(genuine, identity.public_raw, nil)
+    refute Wire.verify_record(relabelled, identity.public_raw, nil)
     peer = peer_at(GOLDEN["certificate_verify_at"])
     peer.fold_state(load(hex("adv_key_epoch_relabelled_delta"))["state"])
     assert_empty peer.states
@@ -522,9 +532,9 @@ class GoldenTest < Minitest::Test
 
     long_after = signed_at + (30 * 3600 * 1000)
     first = load(hex("agent_certificate_cbor"))
-    assert Certificates.verify_at(renewed, identity.public_raw, python, signed_at, long_after)
+    assert Certificates.verify_covering(renewed, identity.public_raw, python, signed_at)
     refute Certificates.verify(renewed, identity.public_raw, python, long_after)
-    refute Certificates.verify_at(first, identity.public_raw, python, signed_at, signed_at)
+    refute Certificates.verify_covering(first, identity.public_raw, python, signed_at)
     peer = peer_at(GOLDEN["renewed_certificate_signed_at"])
     peer.fold_state(load(hex("delta_renewed_certificate_cbor"))["state"])
     assert_equal [entry], peer.states.keys

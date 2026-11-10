@@ -37,7 +37,8 @@ class JRubyFaceTest < Minitest::Test
 
     def initialize = @audited = Queue.new
 
-    take JShop::Order, space: "orders", lease: "30s", where: { quantity: 1.. }, produces: JShop::Shipment
+    take JShop::Order, space: "orders", lease: "30s", where: { quantity: 1.. }, pre: ["order.paid"],
+                       post: ["order.shipped"], cost: "PT2M", produces: JShop::Shipment
     def ship(order)
       JShop::Shipment.new(order_id: order.order_id, item: order.item, by: "jruby", weight: order.quantity)
     end
@@ -81,6 +82,8 @@ class JRubyFaceTest < Minitest::Test
     card = bound.first.card
     assert_equal "jr-fulfiller", card.agent.localName
     assert_equal %w[audit judge ship], card.actions.to_a.map(&:name).sort
+    contract = card.actions.to_a.find { |a| a.name == "ship" }.contract
+    assert_equal [["order.paid"], ["order.shipped"], "PT2M"], [contract.pre.to_a, contract.post.to_a, contract.cost]
     assert_includes card.consumes.to_a, "rbjr.shop.Order#v1"
 
     client = fleet(free_port, ["127.0.0.1:#{port}"])
@@ -96,7 +99,7 @@ class JRubyFaceTest < Minitest::Test
 
   class Clerk
     include AgentSpaces::Agent
-    ordered_take JShop::Order, space: "orders", produces: JShop::Receipt
+    ordered_take JShop::Order, space: "orders", pre: ["order.paid"], cost: "1", produces: JShop::Receipt
     def file(order) = JShop::Receipt.new(order_id: order.order_id)
   end
 
@@ -110,6 +113,8 @@ class JRubyFaceTest < Minitest::Test
                                                       { JShop::Order => "rbjr.shop.Order",
                                                         JShop::Receipt => "rbjr.shop.Receipt" }).last
     assert_includes source, "@ai.badmonkey.agentspaces.agent.annotation.OrderedTake(space = \"orders\""
+    assert_includes source, 'pre = {"order.paid"}, cost = "1"'
+    refute_includes source, "post ="
   ensure
     worker&.close
   end

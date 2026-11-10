@@ -44,6 +44,33 @@ module GoldenHelpers
 
   def cbor(value) = AgentSpaces::CBOR.dump(value)
 
+  # new java.util.Random(seed).nextBytes(new byte[n]): the 48-bit LCG, little-endian ints.
+  # With skip (a multiple of 4), the n bytes from offset skip of that stream: the LCG
+  # jumps skip / 4 steps at once by composing its affine map.
+  def java_random_bytes(seed, n, skip: 0)
+    mask = (1 << 48) - 1
+    s = (seed ^ 0x5DEECE66D) & mask
+    steps = skip / 4
+    a = 0x5DEECE66D
+    c = 0xB
+    while steps.positive?
+      s = ((a * s) + c) & mask if steps.odd?
+      c = ((a * c) + c) & mask
+      a = (a * a) & mask
+      steps >>= 1
+    end
+    out = String.new(encoding: Encoding::BINARY)
+    while out.bytesize < n
+      s = ((s * 0x5DEECE66D) + 0xB) & mask
+      rnd = s >> 16
+      [4, n - out.bytesize].min.times do
+        out << (rnd & 0xFF)
+        rnd >>= 8
+      end
+    end
+    out
+  end
+
   def load(bytes) = AgentSpaces::CBOR.load(bytes)
 
   # Waits up to timeout seconds for the block to be truthy.

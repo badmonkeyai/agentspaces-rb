@@ -38,11 +38,10 @@ module AgentSpaces
       CBOR.dump({ "ephemeralKey" => ephemeral_key.b, "nonce" => nonce.b, "remote" => remote, "echo" => echo&.b })
     end
 
-    # The hello a body decodes to, or nil when it is not one.
+    # The hello a body decodes to, or nil when it is not one: a
+    # Bodies.SessionHello in the wire encoding (HLC round six, 2026-11-08, F3).
     def self.parse_hello(body)
-      hello = CBOR.load(body)
-      return nil unless hello.is_a?(Hash)
-
+      hello = Wire.decode_body("SESSION_HELLO", body)
       key = hello["ephemeralKey"]
       nonce = hello["nonce"]
       echo = hello["echo"]

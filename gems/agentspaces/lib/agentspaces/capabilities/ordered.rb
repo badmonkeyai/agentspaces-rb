@@ -69,12 +69,11 @@ module AgentSpaces
       end
 
       # The Frame a member received, as a Hash of the present fields, or nil
-      # when malformed: what a test voter (or a future Ruby voter) dispatches on.
+      # when it is no RaftMessages.Frame in the wire encoding, as Java's
+      # fromWire reads one (HLC round seven, 2026-11-08): what a test voter
+      # (or a future Ruby voter) dispatches on.
       def self.parse_frame(payload)
-        frame = CBOR.load(payload)
-        return nil unless frame.is_a?(Hash)
-
-        frame.select { |k, v| FRAME_FIELDS.include?(k) && !v.nil? }
+        Schema.load("RaftMessages.Frame", payload).compact
       rescue CBOR::Error
         nil
       end
@@ -177,10 +176,10 @@ module AgentSpaces
             current = peer.claim_of(entry_id)
             next if current && current.fetch("expiresAtMillis", 0).to_i > now
 
-            raw = peer.payload_of(dto)
-            next if raw.nil?
+            value = peer.value_of(dto)
+            next if value.nil?
 
-            payload = CBOR.load(raw)
+            payload = value.first
             next if matches && !matches.call(payload || {}, record["tags"] || {})
 
             epoch = current ? Integer(current["epoch"]) + 1 : 1

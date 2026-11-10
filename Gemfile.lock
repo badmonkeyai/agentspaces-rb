@@ -1,7 +1,8 @@
 PATH
   remote: gems/agentspaces
   specs:
-    agentspaces (0.5.0)
+    agentspaces (0.6.0)
+      bigdecimal (>= 3.1)
       logger (>= 1.5)
 
 GEM
@@ -191,7 +192,7 @@ CHECKSUMS
   actionpack (8.1.4) sha256=245493cc51be195a7645e6fc184880fa7e5b32ff1a08e053ee31f58c76e30ea4
   actionview (8.1.4) sha256=eff1efd07c4d969abad288322b423bcb67fdbab5e324c91ca37352b80f226076
   activesupport (8.1.4) sha256=891dd3fe43c4fc8391934b237b1189bb1f661c932a84a840043db9d46a4e80df
-  agentspaces (0.5.0)
+  agentspaces (0.6.0)
   base64 (0.3.0) sha256=27337aeabad6ffae05c265c450490628ef3ebd4b67be58257393227588f5a97b
   bigdecimal (4.0.1) sha256=8b07d3d065a9f921c80ceaea7c9d4ae596697295b584c296fe599dd0ad01c4a7
   bigdecimal (4.0.1-java) sha256=95c40a0a92dfb83b293f4b9865cd27caa7c045bedab86f3620e5dc27e6553083

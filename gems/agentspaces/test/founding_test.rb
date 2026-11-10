@@ -224,7 +224,15 @@ class FoundingTest < Minitest::Test
                  adv_key_epoch_relabelled_record_cbor adv_key_epoch_relabelled_delta adv_key_wrap_wrong_group_cbor
                  adv_key_wrap_wrong_group_binding_cbor adv_key_wrap_wrong_epoch_cbor
                  adv_key_wrap_wrong_epoch_binding_cbor adv_key_wrap_wrong_rotator_cbor
-                 adv_key_wrap_wrong_rotator_binding_cbor adv_credential_revocation_cross_issuer_cbor]
+                 adv_key_wrap_wrong_rotator_binding_cbor adv_credential_revocation_cross_issuer_cbor
+                 adv_app_card_kind_realm_cbor adv_app_card_sign_on_tenant_cbor adv_app_card_formats_empty_cbor
+                 adv_app_card_origin_attrs_empty_cbor adv_app_card_formats_bound_cbor adv_app_card_formats_upper_cbor
+                 adv_app_card_formats_duplicate_cbor adv_app_card_formats_parameter_cbor
+                 adv_app_card_origin_system_cbor adv_app_card_origin_attrs_prefix_cbor
+                 adv_app_card_origin_ref_bound_cbor adv_app_card_spill_placeholder_cbor
+                 adv_app_card_spill_parts_order_cbor adv_app_card_spill_parts_unknown_cbor
+                 adv_app_card_spill_parts_empty_cbor adv_app_card_spill_root_codec_cbor
+                 adv_app_card_spill_size_zero_cbor adv_agent_card_spill_actions_cbor]
     assert_equal [], GOLDEN.keys.grep(/\Aadv_/) - covered
   end
 end

@@ -37,6 +37,10 @@ jobs:
         ruby: [ '3.3', '3.4', '4.0' ]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Docs lint
+        # The README's shape and the docs folder's index (docs/README-SHAPE.md in the
+        # workspace); the same script runs in every public repository.
+        run: node tools/docs-lint.mjs .
       - uses: ruby/setup-ruby@de492cf36cbab201753d720ce4f4e336cd688c94 # v1.336.0
         with:
           ruby-version: ${{ matrix.ruby }}
@@ -65,7 +69,7 @@ jobs:
         run: bundle exec rake test
 
   # The JRuby face binds through the Java binder of agentspaces-runtime. Its
-  # jars resolve from Maven Central, so this job fails until AgentSpaces 0.5.0
+  # jars resolve from Maven Central, so this job fails until AgentSpaces 0.6.0
   # is published there.
   jruby-face:
     name: JRuby face

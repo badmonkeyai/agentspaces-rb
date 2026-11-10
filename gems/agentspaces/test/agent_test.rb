@@ -35,7 +35,7 @@ class AgentTest < Minitest::Test
     end
 
     take Shop::Task, space: "tasks", lease: "1m", poll_timeout: "500ms", where: { priority: 1.. },
-                     produces: Shop::Finding
+                     pre: ["topic.open"], post: ["topic.researched"], cost: "low", produces: Shop::Finding
     def research(task)
       @seen << task.topic
       raise "no take context" if AgentSpaces::TakeContext.current.nil?
@@ -112,6 +112,11 @@ class AgentTest < Minitest::Test
     assert_raises(DefinitionError) { Class.new { include AgentSpaces::Agent; take(String, space: "x") { nil } } }
     assert_raises(DefinitionError) { Class.new { include AgentSpaces::Agent; notify(Shop::Task, space: "x", on: "GONE") { nil } } }
     assert_raises(DefinitionError) { Class.new { include AgentSpaces::Agent; join(space: "x", key: "k", parts: [], mode: "local") { nil } } }
+    error = assert_raises(DefinitionError) { Class.new { include AgentSpaces::Agent; take(Shop::Task, space: "x", pre: "ready") { nil } } }
+    assert_match(/pre "ready" is not a list of at most 32 texts/, error.message)
+    assert_raises(DefinitionError) { Class.new { include AgentSpaces::Agent; take(Shop::Task, space: "x", post: %w[a] * 33) { nil } } }
+    error = assert_raises(DefinitionError) { Class.new { include AgentSpaces::Agent; take(Shop::Task, space: "x", cost: "x" * 65) { nil } } }
+    assert_match(/cost is a text of at most 64 characters/, error.message)
     dangling = Class.new do
       include AgentSpaces::Agent
       take Shop::Task, space: "tasks"
@@ -131,6 +136,9 @@ class AgentTest < Minitest::Test
     assert_equal ["com.acme.Finding#v1"], card["produces"]
     assert_equal({ "com.acme.Task#v1" => "tasks" }, card["spaceBindings"])
     assert_equal %w[audit research], card["actions"].map { |a| a["name"] }
+    assert_nil card["actions"].first["contract"], "an action with no pre, post, or cost carries no contract"
+    assert_equal({ "pre" => ["topic.open"], "post" => ["topic.researched"], "cost" => "low", "methods" => [] },
+                 card["actions"].last["contract"])
     refute_nil card["agentCertificate"]
     # The certificate covers the card's issue instant, or Java's discovery refuses the card.
     assert AgentSpaces::Certificates.covers?(card["agentCertificate"], AgentSpaces::Instants.parse_millis(card["issued"]))

@@ -16,7 +16,7 @@
 
 module AgentSpaces
   # The gem version follows the AgentSpaces core version.
-  VERSION = "0.5.0"
+  VERSION = "0.6.0"
   # The SPEC revision and wire version this release implements.
   SPEC_VERSION = "0.1.23"
   WIRE_VERSION = 3

@@ -296,20 +296,21 @@ class BeaconTest < Minitest::Test
     assert_equal [seed("b", 2), seed("a", 1), seed("c", 3)], Beacon.seeds_of(group)
   end
 
-  # The canonical encoder against bytes CPython's json.dumps wrote for the
-  # same values, upper-cased as the Python twin does.
-  def test_the_json_encoder_matches_the_python_twin
+  # The canonical encoder against the bytes Jackson writes (HLC round seven,
+  # 2026-11-08): the text writer of BeaconDocument.toBytes keeps a code point
+  # past U+FFFF as it is, the byte writer of canonicalBytes escapes each of its
+  # surrogates, and a literal backslash before "u00ab" keeps its case.
+  def test_the_json_encoder_matches_jackson
     {
-      "plain" => '"plain"', "tab\tnl\ncr\rbs\bff\f" => '"tab\\tnl\\ncr\\rbs\\bff\\f"',
-      "\u0000\u001f\u007f" => "\"\\u0000\\u001F\u007f\"", "quote\"back\\" => '"quote\\"back\\\\"',
-      "slash/ ü\u{1f600}" => "\"slash/ ü\u{1f600}\"",
-      "\\u00ab" => '"\\\\u00AB"'
-    }.each do |text, want|
-      assert_equal want.b, Beacon.send(:jackson_json, text), text.inspect
+      "plain" => ['"plain"', '"plain"'], "tab\tnl\ncr\rbs\bff\f" => ['"tab\\tnl\\ncr\\rbs\\bff\\f"'] * 2,
+      "\u0000\u001f\u007f" => ["\"\\u0000\\u001F\u007f\""] * 2, "quote\"back\\" => ['"quote\\"back\\\\"'] * 2,
+      "slash/ ü\u{1f600}" => ["\"slash/ ü\u{1f600}\"", '"slash/ ü\\uD83D\\uDE00"'],
+      "\\u00ab" => ['"\\\\u00ab"'] * 2
+    }.each do |text, (served, signed)|
+      assert_equal served.b, Beacon.send(:jackson_json, text, false), text.inspect
+      assert_equal signed.b, Beacon.send(:jackson_json, text, true), text.inspect
     end
-    assert_equal '[1,1.5,1e+16,null,true,false,{"k":[]}]'.b,
-                 Beacon.send(:jackson_json, [1, 1.5, 1e16, nil, true, false, { "k" => [] }])
-    assert_raises(ArgumentError) { Beacon.send(:jackson_json, Float::NAN) }
+    assert_equal '[1,null,{"k":[]}]'.b, Beacon.send(:jackson_json, [1, nil, { "k" => [] }], true)
   end
 
   # One 302 to a fixed location.

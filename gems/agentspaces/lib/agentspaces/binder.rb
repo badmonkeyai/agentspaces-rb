@@ -132,7 +132,9 @@ module AgentSpaces
           produces.concat(produced)
           bindings[schema] = clause.options[:space] if clause.verb == :take
           actions << Wire.card_action(clause.method_name.to_s, clause.options[:description].to_s, [schema], produced,
-                                      clause.verb.to_s, clause.options[:space])
+                                      clause.verb.to_s, clause.options[:space],
+                                      contract: Wire.card_contract(clause.options[:pre], clause.options[:post],
+                                                                   clause.options[:cost]))
           clause.verb == :take ? start_take(bound, method, clause) : start_notify(bound, method, clause)
         when :propose
           schema = Entry.schema_of(clause.cue)

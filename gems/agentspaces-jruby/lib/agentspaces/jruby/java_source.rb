@@ -167,6 +167,15 @@ module AgentSpaces
         }
       end
 
+      # The planner contract's attributes, each left to the annotation's default when unset.
+      def contract(options)
+        {
+          "pre" => options[:pre] && strings(options[:pre]),
+          "post" => options[:post] && strings(options[:post]),
+          "cost" => options[:cost].to_s.empty? ? nil : literal(options[:cost])
+        }
+      end
+
       # One annotated abstract method per clause; returns [annotation line, signature].
       def method_for(clause, names)
         options = clause.options.merge(produces_classes: clause.produces.select { |p| Entry.entry_class?(p) })
@@ -177,9 +186,11 @@ module AgentSpaces
         base = common(options, names, cue)
         case clause.verb
         when :take
-          ["@#{ANNOTATION}.SpaceTake(#{attributes(base)})", "#{result} #{method}(#{names.fetch(cue)} cue)"]
+          ["@#{ANNOTATION}.SpaceTake(#{attributes(base.merge(contract(options)))})",
+           "#{result} #{method}(#{names.fetch(cue)} cue)"]
         when :ordered_take
-          ["@#{ANNOTATION}.OrderedTake(#{attributes(base)})", "#{result} #{method}(#{names.fetch(cue)} cue)"]
+          ["@#{ANNOTATION}.OrderedTake(#{attributes(base.merge(contract(options)))})",
+           "#{result} #{method}(#{names.fetch(cue)} cue)"]
         when :notify
           kinds = Array(options[:on]).map { |k| "ai.badmonkey.agentspaces.api.space.SpaceEvent.Kind.#{identifier!(k, 'event kind')}" }
           notify = base.merge("on" => "{#{kinds.join(', ')}}")

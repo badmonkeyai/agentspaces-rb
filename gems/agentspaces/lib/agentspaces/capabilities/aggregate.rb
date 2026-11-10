@@ -297,13 +297,15 @@ module AgentSpaces
         ex[1] = value if ex[1].nan? || (ex[0] ? value > ex[1] : value < ex[1])
       end
 
+      # HLC round seven, 2026-11-08: a frame decodes as Java's fromWire reads
+      # it, under its annex I schema and the canonical-bytes rule, or it is
+      # dropped unheard.
       def on_frame(_sender, payload)
         frame = begin
-          CBOR.load(payload)
+          Schema.load("PushSumAggregate.Frame", payload)
         rescue CBOR::Error
           return
         end
-        return unless frame.is_a?(Hash)
 
         @exchanged = true
         share = frame["share"]
@@ -315,26 +317,20 @@ module AgentSpaces
         @lock.synchronize do
           @received[heard] = @received.fetch(heard, 0) + 1 unless heard.nil?
           if share.is_a?(Hash) && share["epochId"].is_a?(String)
-            value = number(share["value"])
-            weight = number(share["weight"])
+            value = share["value"]
+            weight = share["weight"]
             if value.finite? && weight.finite? && weight >= 0.0
               e = (@epochs[share["epochId"]] ||= [0.0, 0.0])
               e[0] += value
               e[1] += weight
             end
           elsif extremum.is_a?(Hash) && extremum["epochId"].is_a?(String)
-            # Java writes a boolean; any other value counts by Ruby truthiness
-            # (Python's bool() would also read 0 and "" as false).
-            merge_extremum(extremum["epochId"], extremum["max"] ? true : false, number(extremum["value"]))
-          elsif roster.is_a?(Hash) && roster["epochId"].is_a?(String)
-            members = (@rosters[roster["epochId"]] ||= Set.new)
-            Array(roster["members"]).each { |m| members << Integer(m) }
+            merge_extremum(extremum["epochId"], extremum["max"], extremum["value"])
+          elsif roster.is_a?(Hash) && roster["epochId"].is_a?(String) && !roster["members"].nil?
+            (@rosters[roster["epochId"]] ||= Set.new).merge(roster["members"])
           end
         end
       end
-
-      # A wire number as a Float; anything else is NaN.
-      def number(value) = value.is_a?(Integer) || value.is_a?(Float) ? Float(value) : Float::NAN
     end
   end
 end

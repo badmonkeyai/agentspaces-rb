@@ -242,9 +242,38 @@ class CapabilitiesTest < Minitest::Test
     assert_equal "jobs a b", Semantic.text_of("SpaceAdvertisement", { "spaceName" => "jobs",
                                                                        "schemaHints" => %w[a b] })
     assert_equal "aspace://x", Semantic.text_of("Other", { "id" => "aspace://x" })
+    # AppCard origin and formats, 2026-11-09 (FR-9): origin and formats follow the url, and a stub ranks by its
+    # inline fields, which carry both.
+    app = { "name" => "n", "kind" => "fed", "shape" => "static", "owner" => "o", "url" => "u" }
+    assert_equal "n fed static o u", Semantic.text_of("AppCard", app)
+    assert_equal "n fed static o u realm example-realm/app text/html urn:realm:example-realm#",
+                 Semantic.text_of("AppCard", app.merge("origin" => { "system" => "realm", "ref" => "example-realm/app" },
+                                                       "formats" => ["text/html", "urn:realm:example-realm#"]))
+    stub = CBOR.load(hex("app_card_spill_cbor"))
+    assert_equal "example-board fed a2ui example  console example-console/example-board",
+                 Semantic.text_of("AppCard", stub)
   end
 
   # ---------------------------------------------------------------- remote
+
+  # AppCard origin and formats, 2026-11-09 (FR-15): a spilled card's actions
+  # sit in its parts document, so remote actions resolve the stub first and a
+  # stub this peer cannot resolve offers nothing.
+  def test_remote_actions_resolve_a_spilled_card_and_skip_one_they_cannot
+    issuer = Identity.generate
+    stub = CBOR.load(hex("agent_card_spill_cbor"))
+    stub = stub.merge("id" => "aspace://zApps/agent/#{issuer.peer_id}/researcher", "issuer" => issuer.peer_id,
+                      "agent" => "#{issuer.peer_id}/researcher")
+    now = Instants.parse_millis("2026-11-09T09:05:00Z")
+    reader = Peer.new(Identity.generate, "zApps", clock: -> { now / 1000.0 })
+    refute_nil reader.accept_ad(Wire.stored_ad("AgentCard", stub, issuer))
+    assert_empty RemoteActions.actions(reader), "an unresolved stub offers no action"
+    document = hex("agent_card_parts_cbor")
+    reader.spill_store = Object.new.tap { |store| store.define_singleton_method(:get) { |_root, _size| document } }
+    found = RemoteActions.actions(reader)
+    assert_equal [["research", "Task", "Finding", "tasks"]], found.map { |x| [x.name, x.consumes, x.produces, x.space] }
+    assert_equal "research", found.first.card["actions"].first["name"], "the action carries the resolved card"
+  end
 
   def test_a_remote_action_from_a_card_is_invoked_through_the_task_space
     a, b = fleet

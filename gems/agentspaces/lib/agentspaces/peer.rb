@@ -29,8 +29,10 @@ module AgentSpaces
   # same golden vectors.
   class Peer
     SCHEMES_SKIPPED = %w[dtls udp quic webrtc].freeze
-    # The settle window a take waits out after its claim (ReplicatedSpace's default).
-    SETTLE_MILLIS = 600
+    # The race allowance a contesting claim's stamp gets past the drift
+    # ceiling: Java's default ReplicatedSpace settle window, 200 ms (HLC round
+    # six, 2026-11-08, R6).
+    CONTEST_SETTLE_MILLIS = 200
 
     @live = ObjectSpace::WeakMap.new
     class << self
@@ -48,11 +50,37 @@ module AgentSpaces
     # whose EntryStateDto carries no record (SPEC v0.1.17 §9 hints;
     # srad/agentspaces-pdt.md 3.9, PD-L-04).
     RECORDLESS_HINT = "wire.recordless"
+    # The wire hint that says every decoder of this client reads the v0.1.32
+    # AppCard and AgentCard schemas and their value rules (SPEC §9 hints,
+    # §6.1a.2; AppCard origin and formats, 2026-11-09, FR-6), and the level
+    # this build reads. Level 1 advertises no hint, so a test builds a mixed
+    # fleet.
+    APPCARD_HINT = "wire.appcard"
+    APPCARD_LEVEL = 2
+    # The advertisement cache's bounds (SPEC §6.3 v0.1.32, FR-11): the most
+    # advertisements it holds and the most bytes of their encodings.
+    AD_CACHE_MAX_ENTRIES = 8192
+    AD_CACHE_MAX_BYTES = 33_554_432
+    # A resolution that fails a check of its parts document (FR-15). The
+    # cached stub stays and nobody is struck.
+    class ResolveError < StandardError; end
     # Recordless states held for entries whose record has not arrived: at most this many.
     MAX_PENDING_STATES = 1024
     # How many distinct refused states and claims the peer remembers, so an
-    # offer it already counted counts once (HLC canonical stamps, 2026-11-08).
+    # offer it already counted counts once (HLC canonical stamps, 2026-11-08),
+    # and how many distinct deferred ones; each memory evicts its least
+    # recently offered key (HLC round five, 2026-11-08 (E14)).
     REFUSED_STAMP_MEMORY = 4096
+    # The record each non-space stream's PULL_RESP delta holds (HLC round
+    # six, 2026-11-08, F3): AdCache.Delta, and RevocationRegistry's array of
+    # SignedRevocation.
+    # The fewest claims the claim map holds before prune_claims runs (R10).
+    CLAIMS_PRUNE_FLOOR = 1024
+    PULL_DELTAS = {
+      "ads" => "AdCache.Delta",
+      Revocation::PEER_STREAM => [:list, "RevocationRegistry.SignedRevocation"],
+      Revocation::CREDENTIAL_STREAM => [:list, "RevocationRegistry.SignedRevocation"]
+    }.freeze
 
     attr_reader :identity, :group, :states, :claims, :members, :reachable, :ads, :pipe_handlers, :revocations,
                 :founding, :frames, :ignored_kinds, :malformed_frames, :reconnects, :seed_peer, :resource_hints,
@@ -64,10 +92,29 @@ module AgentSpaces
     # with a member that advertises it too; :signed: sign every frame.
     attr_accessor :channel_auth
     attr_reader :session, :session_frames_sent, :session_peers
+    attr_reader :ad_cache_max_entries, :ad_cache_max_bytes, :spill_max_fetch_bytes
+    # Where resolve fetches a stub's parts document (SPEC §6.1a.5): an object
+    # whose get(root, size) returns the document's bytes, raising
+    # ArgumentError when it refuses the artifact for its length. resolve
+    # checks the bytes against spill.root, so any source may serve them. A
+    # content swarm attaches here; with none attached, resolve fails a stub.
+    attr_accessor :spill_store
 
     # clock: a callable returning epoch seconds (a Float); tests pin it.
     # founder: the founder's PeerID when known from configuration.
-    def initialize(identity, group, clock: nil, founder: nil, dialers: nil, logger: nil)
+    # appcard_level: the AppCard level advertised under wire.appcard (1 or 2).
+    # ad_cache_max_entries, ad_cache_max_bytes: the cache's bounds.
+    # spill_max_fetch_bytes: the largest parts document resolve fetches.
+    def initialize(identity, group, clock: nil, founder: nil, dialers: nil, logger: nil, appcard_level: APPCARD_LEVEL,
+                   ad_cache_max_entries: AD_CACHE_MAX_ENTRIES, ad_cache_max_bytes: AD_CACHE_MAX_BYTES,
+                   spill_max_fetch_bytes: Cards::CARD_SPILL_MAX_FETCH_BYTES)
+      unless [1, APPCARD_LEVEL].include?(appcard_level) && appcard_level.is_a?(Integer)
+        raise ArgumentError, "this build reads AppCard levels 1 to #{APPCARD_LEVEL}: #{appcard_level.inspect}"
+      end
+
+      @ad_cache_max_entries = positive!(ad_cache_max_entries, "ad_cache_max_entries")
+      @ad_cache_max_bytes = positive!(ad_cache_max_bytes, "ad_cache_max_bytes")
+      @spill_max_fetch_bytes = positive!(spill_max_fetch_bytes, "spill_max_fetch_bytes")
       @identity = identity
       @group = group
       @clock = clock || -> { Time.now.to_f }
@@ -77,9 +124,18 @@ module AgentSpaces
       @channel = nil
       @states = {}
       @claims = {}
+      @claims_prune_at = CLAIMS_PRUNE_FLOOR
       @members = {}
       @reachable = Set.new
       @ads = {}
+      @ad_bytes = 0
+      @ads_refused_cache_full = 0
+      @app_cards_downgraded = 0
+      @cards_oversize_inline = 0
+      @card_size_warned = {}
+      @spills_refused = 0
+      @spills_over_limit = 0
+      @spill_store = nil
       @pipe_handlers = {}
       @revocations = Revocation::Registry.new(-> { founder_id }, -> { @group })
       @running = false
@@ -89,8 +145,12 @@ module AgentSpaces
       @frames = Wire::FrameFilter.new
       @ignored_kinds = Hash.new(0)
       @malformed_frames = 0
-      @refused_stamps = { "states" => 0, "claims" => 0 }
+      @stamps_logical_refused = 0
+      @stamps_far_future_refused = 0
+      @stamps_far_future_deferred = 0
+      @deltas_undecodable = 0
       @refused_offers = {}
+      @deferred_offers = {}
       @seed = nil
       @seeds = []
       @refresh_seeds = nil
@@ -98,6 +158,7 @@ module AgentSpaces
       # The wire hints beside the resource hints in the self-advertisement:
       # wire.recordless says a recordless renew, cancel, or complete is accepted.
       @wire_hints = { RECORDLESS_HINT => "1" }
+      @wire_hints[APPCARD_HINT] = APPCARD_LEVEL.to_s if appcard_level == APPCARD_LEVEL
       # Recordless states by entry id, kept without an event until the whole
       # DTO arrives through anti-entropy (PD-L-02).
       @pending_states = {}
@@ -113,6 +174,11 @@ module AgentSpaces
       @block_asked = {}
       @reconnect_interval = 5.0
       @reconnect_window = 600.0
+      # When the current link was dialed, and how many links in a row ended
+      # within the reconnect interval: such a link counts as a failed round of
+      # dials (swarm retries, ROBUSTNESS.md 10.6).
+      @link_since = 0.0
+      @quick_drops = 0
       @peer_ad_interval = 30.0
       @reconnects = 0
       @fold_lock = Mutex.new
@@ -282,8 +348,11 @@ module AgentSpaces
       entry_id
     end
 
-    # Publishes an advertisement this peer issued on the "ads" stream.
+    # Publishes an advertisement this peer issued on the "ads" stream. An
+    # AppCard or AgentCard passes the card rules of SPEC v0.1.32 first
+    # (issue_card).
     def publish_ad(ad_type, ad)
+      ad = issue_card(ad_type, ad) if CARD_TYPES.include?(ad_type)
       stored = Wire.stored_ad(ad_type, ad, @identity)
       accept_ad(stored)
       item_id = "#{ad['id']}:#{Instants.parse_millis(ad['issued'])}"
@@ -337,31 +406,65 @@ module AgentSpaces
       end
     end
 
+    # The full card of a stub (SPEC §6.1a.5; AppCard origin and formats,
+    # 2026-11-09, FR-15): a card without spill as it stands, and otherwise the
+    # stub completed from its parts document, which the spill store fetches by
+    # root. A size above spill_max_fetch_bytes fails before any fetch and
+    # counts in spills_over_limit; a document of another length or another
+    # content root, one that does not decode as the kind's parts record, or one
+    # whose non-empty fields are not exactly spill.parts fails and counts in
+    # spills_refused. Either failure raises ResolveError. An error the store
+    # raises for any other reason (no holder served the document) propagates
+    # uncounted. No failure touches the cached stub or strikes anyone.
+    def resolve(card)
+      spill = card["spill"]
+      return card if spill.nil?
+
+      if spill["size"] > @spill_max_fetch_bytes
+        count(:@spills_over_limit)
+        raise ResolveError, "the parts document of #{card['id']} is #{spill['size']} bytes, above the fetch bound of " \
+                            "#{@spill_max_fetch_bytes}"
+      end
+      store = @spill_store
+      raise ResolveError, "no content swarm serves this group, so the stub #{card['id']} stays a stub" if store.nil?
+
+      complete_stub(card, spill, store)
+    end
+
+    def ads_refused_cache_full = @state_lock.synchronize { @ads_refused_cache_full }
+
+    # The sum of the encodings the advertisement cache holds.
+    def ad_cache_bytes = @state_lock.synchronize { @ad_bytes }
+
+    def app_cards_downgraded = @state_lock.synchronize { @app_cards_downgraded }
+
+    def cards_oversize_inline = @state_lock.synchronize { @cards_oversize_inline }
+
+    def spills_refused = @state_lock.synchronize { @spills_refused }
+
+    def spills_over_limit = @state_lock.synchronize { @spills_over_limit }
+
     # Admits a StoredAd as AdCache.accept does: the signature, the issuer
     # derived from the key, and the TTL not yet passed.
+    # HLC round six, 2026-11-08 (F3): the StoredAd and its adBytes hold to
+    # their records, the ad to the one its adType names (AdCache.AD_TYPES);
+    # an unknown adType or a relabelled ad is undecodable and dropped.
     def accept_ad(stored)
-      return nil unless stored.is_a?(Hash)
-
-      ad_bytes = stored["adBytes"]
-      key = stored["publicKey"]
-      signature = stored["signature"]
-      return nil unless ad_bytes.is_a?(String) && key.is_a?(String) && signature.is_a?(String)
+      Schema.check("AdCache.StoredAd", stored)
+      ad_type, ad_bytes, key, signature = stored.values
+      return nil unless Schema::AD_TYPES.include?(ad_type) && ad_bytes && signature && key&.bytesize == 32
       return nil unless Crypto.port.verify(key, ad_bytes, signature)
 
-      ad = CBOR.load(ad_bytes)
-      return nil unless ad.is_a?(Hash) && ad["issuer"] == Derive.id(key)
+      ad = Schema.load(ad_type, ad_bytes)
+      return nil unless ad["issuer"] == Derive.id(key)
 
       issued = Instants.parse_millis(ad["issued"])
       expires = issued + Instants.parse_duration_millis(ad["ttl"])
       return nil if expires <= now_ms
 
       entry = { "type" => stored["adType"], "ad" => ad, "stored" => stored, "issuer" => ad["issuer"],
-                "expires" => expires }
-      @state_lock.synchronize do
-        previous = @ads[ad["id"]]
-        @ads[ad["id"]] = entry if previous.nil? || Instants.parse_millis(previous["ad"]["issued"]) <= issued
-        @ads[ad["id"]]
-      end
+                "expires" => expires, "bytes" => ad_bytes.bytesize }
+      @state_lock.synchronize { admit_ad(entry, issued) }
     rescue CBOR::Error, ArgumentError, TypeError, NoMethodError
       nil
     end
@@ -446,42 +549,161 @@ module AgentSpaces
       cid
     end
 
+    # The decoded value of an entry's payload as [value], or nil while the
+    # payload is not held or when it is no document of the wire encoding:
+    # such an entry stays replicated, since its signature covers the bytes,
+    # and every read skips its value (HLC round six, 2026-11-08, F3 section 3.1).
+    def value_of(dto)
+      raw = payload_of(dto)
+      raw && [CBOR.load(raw)]
+    rescue CBOR::Error
+      nil
+    end
+
     # Decoded values of known live entries of one schema type.
     def find(type_name)
       @states.values.filter_map do |dto|
         record = dto["record"] || {}
         next unless record["type"] == type_name && !dto["completed"]
 
-        payload = payload_of(dto)
-        payload && CBOR.load(payload)
+        value_of(dto)&.first
       end
     end
 
     # ----------------------------------------------------------- the folds
 
     # Folds one received state DTO: verified (record and transition), refused
-    # when its actor is revoked, then joined as the Java CRDT joins it.
+    # when its actor is revoked, judged for its stamps, then joined as the
+    # Java CRDT joins it. HLC round five, 2026-11-08 (E6): the revocation
+    # check runs before the stamp checks, so a revoked actor's state counts
+    # in no stamp counter.
+    # HLC round six, 2026-11-08 (F1, F3): a state that does not hold to
+    # SpaceWire.EntryStateDto is undecodable and counts in deltas_undecodable,
+    # as the carrier that brought it would (space_delta).
     def fold_state(dto)
+      return count_undecodable unless decodes?("SpaceWire.EntryStateDto", dto)
+
+      merge_state(dto)
+    end
+
+    # Folds one signed claim after validating its bindings, bounds, proof,
+    # and holder (ASF-002, ASF-004, ASF-033). HLC round five, 2026-11-08
+    # (E6): signatures and certificate first, then the holder's revocation,
+    # then the stamp checks, so a revoked holder's claim counts in no stamp
+    # counter. HLC round six, 2026-11-08 (F1, F3): a claim that does not hold
+    # to SpaceWire.SignedClaim (a TakeClaim in record order whose numbers have
+    # their declared types) is undecodable and counts in deltas_undecodable.
+    def fold_claim(entry_id, signed)
+      return count_undecodable unless decodes?("SpaceWire.SignedClaim", signed)
+
+      claim = signed["claim"]
+      return unless claim["entryId"] == entry_id
+      return unless Wire.verify_claim_proof(signed)
+
+      epoch = claim["epoch"]
+      expires = claim["expiresAtMillis"]
+
+      certificate = signed["holderCertificate"] || {}
+      return if @revocations.refuses?(claim["holder"], certificate["agentPublicKey"], nil)
+      # HLC logical counter, 2026-11-08 (Rust team report): the peer drops a
+      # claim whose stamp the strict parser refuses. It counts the refusal
+      # after verification, once per distinct claim, as Java's mergeClaim does
+      # (HLC canonical stamps, 2026-11-08).
+      return refuse_claim(entry_id, claim, :logical) unless Wire.hlc_acceptable?(claim["stamp"])
+
+      stamped = Wire.hlc_physical(claim["stamp"])
+      # HLC round four, 2026-11-08 (D4): a claim stamped past the skew margin
+      # waits for a later offer; one an hour further is hostile.
+      lead = Wire.hlc_far_future(stamped, now_ms)
+      return refuse_claim(entry_id, claim, :far_future) if lead == :hostile
+
+      current = claim_of(entry_id)
+      observed = (current || {}).fetch("epoch", 0).to_i
+      return if epoch > observed + Wire::MAX_CLAIM_EPOCH_JUMP || expires > now_ms + Wire::MAX_CLAIM_HOLD_MILLIS
+
+      issued = (@states[entry_id] || {}).dig("record", "issued")
+      # SPEC 7.4/11 (ReplicatedSpace): a claim cannot predate the entry it
+      # answers, and a rival holder's claim older than the drift and settle
+      # bounds arrives too late to contest the current one.
+      return if issued && stamped < Wire.hlc_physical(issued) - Certificates::MAX_DRIFT_MILLIS
+      return if current && current["holder"] != claim["holder"] &&
+                stamped < now_ms - Certificates::MAX_DRIFT_MILLIS - CONTEST_SETTLE_MILLIS
+      # HLC round five, 2026-11-08 (E2): a claim that passes every other check
+      # but runs past the skew margin waits, counted once per distinct claim,
+      # as Java's mergeClaim defers it only when it finds no violation.
+      return defer_offer(claim_offer_key(entry_id, claim)) if lead == :deferred
+
+      winner = @state_lock.synchronize { @claims[entry_id] = Wire.merge_claims(@claims[entry_id], signed) }
+      @on_claim&.call(entry_id, winner)
+      notify_observers { |o| o.claim_folded(entry_id, winner) }
+      wake_fold_waiters
+    end
+
+    def claim_of(entry_id) = @claims[entry_id]&.fetch("claim")
+
+    # The entry's current lease: the state's lease register, which supersedes the
+    # lease its record was written with (SPEC 7.3), as Java's EntryState and the
+    # TypeScript client read it. A renewal moves the register, so reads, takes and
+    # the sweep follow it (lease renewals, 2026-11-09).
+    def self.lease_of(dto) = dto["leaseValue"] || (dto["record"] || {})["lease"] || {}
+
+    # Whether the entry of dto is present, as Java's EntryState.present judges
+    # it: uncompleted, with an add dot no remove covers. A cancel's removes
+    # cover the adds, so a withdrawn entry is absent from reads and takes at
+    # once (core cancel events, 2026-11-09).
+    def self.present?(dto)
+      return false if dto["completed"]
+
+      removed = Array(dto["removes"]).map { |dot| [dot["replica"], dot["counter"]] }
+      Array(dto["adds"]).any? { |dot| !removed.include?([dot["replica"], dot["counter"]]) }
+    end
+
+    # Merges a state that holds to its record: fold_state's, and a recordless
+    # state's over the record this replica holds.
+    def merge_state(dto)
+      # HLC round five, 2026-11-08 (E7): a state without its lease stamp or
+      # lease value decodes, but a lease register holds nothing without both,
+      # so the peer drops it before any judgement, as Java's mergeState does.
+      return if dto["leaseStamp"].nil? || dto["leaseValue"].nil?
       return fold_recordless(dto) if dto["record"].nil?
 
       record = dto["record"]
       entry_id = record["entryId"]
-      return unless entry_id && verify_state(dto, record)
+      return unless entry_id && dots_bound_to_issuer?(dto, record) && verify_state(dto, record)
+
+      if refused_for_revocation?(dto, record)
+        @state_lock.synchronize { @pending_states.delete(entry_id) }
+        return
+      end
       # HLC logical counter, 2026-11-08 (Rust team report): the peer drops a
-      # state whose issue stamp or lease stamp the strict parser refuses. It
-      # counts the refusal after verification, once per distinct state, as
-      # Java's ReplicatedSpace does (HLC canonical stamps, 2026-11-08).
-      return refuse_stamp("states", dto) unless state_stamps_acceptable?(dto, record)
+      # state whose issue stamp, lease stamp, or signedAt the strict parser
+      # refuses. It counts the refusal after verification, once per distinct
+      # state, as Java's ReplicatedSpace does (HLC canonical stamps,
+      # 2026-11-08; HLC round four, 2026-11-08 (D1)).
+      return refuse_state(dto, record, :logical) unless state_stamps_acceptable?(dto, record)
+
+      # HLC round four, 2026-11-08 (D4): a record or lease stamp past the skew
+      # margin waits for a later offer; one an hour further is hostile.
+      case Wire.hlc_far_future(state_lead_ms(dto, record), now_ms)
+      when :deferred then return defer_offer(state_offer_key(dto, record))
+      when :hostile then return refuse_state(dto, record, :far_future)
+      end
 
       pending = @state_lock.synchronize { @pending_states.delete(entry_id) }
-      return if refused_for_revocation?(dto, record)
-
+      # The read and the write share one critical section, so a completion that lands meanwhile
+      # is joined, never overwritten (core cancel events, 2026-11-09).
+      previous = nil
       merged = @state_lock.synchronize do
         previous = @states[entry_id]
         @states[entry_id] = previous.nil? ? dto : join(previous, dto)
       end
       @on_state&.call(merged)
       notify_observers { |o| o.state_folded(merged) }
+      # Core cancel events, 2026-11-09: a cancel that withdraws an entry present here is
+      # announced, and each Space raises EXPIRED for it, as Java's ReplicatedSpace does.
+      if !previous.nil? && Peer.present?(previous) && !Peer.present?(merged) && !merged["completed"]
+        notify_observers { |o| o.state_withdrawn(merged) }
+      end
       wake_fold_waiters
       fold_recordless(pending) unless pending.nil?
     end
@@ -507,7 +729,7 @@ module AgentSpaces
       %w[issuerPublicKey agentCertificate].each do |carried|
         full[carried] = previous[carried] if full[carried].nil? && !previous[carried].nil?
       end
-      fold_state(full)
+      merge_state(full)
     end
 
     # Fills entryId of a recordless state from the rumor item id (r:<id>:<stamp>,
@@ -520,55 +742,30 @@ module AgentSpaces
       state
     end
 
-    # Folds one signed claim after validating its bindings, bounds, proof,
-    # and holder (ASF-002, ASF-004, ASF-033).
-    def fold_claim(entry_id, signed)
-      claim = signed["claim"]
-      holder_key = signed["holderKey"]
-      return unless claim.is_a?(Hash) && holder_key.is_a?(String)
-      return unless claim["entryId"] == entry_id
 
-      epoch = claim["epoch"]
-      bid = claim.fetch("bid", 0.0)
-      expires = claim["expiresAtMillis"]
-      return unless epoch.is_a?(Integer) && epoch.positive? && expires.is_a?(Integer)
-      return unless bid.is_a?(Numeric) && !(bid.is_a?(Float) && (bid.nan? || bid.infinite?))
-      return unless Wire.verify_claim_proof(signed, now_ms)
+    # Verified states and claims refused for a logical counter above the
+    # limit, each distinct one once (HLC logical counter, 2026-11-08 (Rust
+    # team report); HLC round four, 2026-11-08 (D5)). Java's
+    # ReplicatedSpace.stampsLogicalRefused. A Ruby peer keeps no per-member
+    # strikes, so these counts are its record.
+    def stamps_logical_refused = @state_lock.synchronize { @stamps_logical_refused }
 
-      certificate = signed["holderCertificate"] || {}
-      return if @revocations.refuses?(claim["holder"], certificate["agentPublicKey"], nil)
-      # HLC logical counter, 2026-11-08 (Rust team report): the peer drops a
-      # claim whose stamp the strict parser refuses. It counts the refusal
-      # after verification, once per distinct claim, as Java's mergeClaim does
-      # (HLC canonical stamps, 2026-11-08).
-      return refuse_stamp("claims", [entry_id, signed]) unless Wire.hlc_acceptable?(claim["stamp"])
+    # Verified states and claims refused as hostile, each distinct one once:
+    # a stamp more than Wire::HLC_DEFER_WINDOW_MILLIS past the skew margin
+    # (HLC round five, 2026-11-08 (E2)). Java's
+    # ReplicatedSpace.stampsFarFutureRefused.
+    def stamps_far_future_refused = @state_lock.synchronize { @stamps_far_future_refused }
 
-      current = claim_of(entry_id)
-      observed = (current || {}).fetch("epoch", 0).to_i
-      return if epoch > observed + Wire::MAX_CLAIM_EPOCH_JUMP || expires > now_ms + Wire::MAX_CLAIM_HOLD_MILLIS
+    # Verified states and claims deferred because a stamp runs past the skew
+    # margin by at most Wire::HLC_DEFER_WINDOW_MILLIS, each distinct one once
+    # (HLC round five, 2026-11-08 (E2)). Java's
+    # ReplicatedSpace.stampsFarFutureDeferred.
+    def stamps_far_future_deferred = @state_lock.synchronize { @stamps_far_future_deferred }
 
-      stamped = Wire.hlc_physical(claim["stamp"])
-      issued = (@states[entry_id] || {}).dig("record", "issued")
-      # SPEC 7.4/11 (ReplicatedSpace): a claim cannot predate the entry it
-      # answers, and a rival holder's claim older than the drift and settle
-      # bounds arrives too late to contest the current one.
-      return if issued && stamped < Wire.hlc_physical(issued) - Certificates::MAX_DRIFT_MILLIS
-      return if current && current["holder"] != claim["holder"] &&
-                stamped < now_ms - Certificates::MAX_DRIFT_MILLIS - SETTLE_MILLIS
-
-      winner = @state_lock.synchronize { @claims[entry_id] = Wire.merge_claims(@claims[entry_id], signed) }
-      @on_claim&.call(entry_id, winner)
-      notify_observers { |o| o.claim_folded(entry_id, winner) }
-      wake_fold_waiters
-    end
-
-    def claim_of(entry_id) = @claims[entry_id]&.fetch("claim")
-
-    # Counts of verified states and claims refused for a stamp the strict
-    # parser refuses, each distinct one once (HLC logical counter, 2026-11-08
-    # (Rust team report); HLC canonical stamps, 2026-11-08). A Ruby peer
-    # keeps no per-member strikes, so these counts are its record.
-    def refused_stamps = @state_lock.synchronize { @refused_stamps.dup }
+    # Space deltas dropped whole because they do not decode, or because a
+    # stamp they carry does not decode (HLC round four, 2026-11-08 (D3, D5)).
+    # Java's ReplicatedSpace.deltasUndecodable.
+    def deltas_undecodable = @state_lock.synchronize { @deltas_undecodable }
 
     # ----------------------------------------------------------- take/complete
 
@@ -593,10 +790,10 @@ module AgentSpaces
           record = dto["record"] || {}
           next unless record["spaceId"] == space_id
 
-          raw = payload_of(dto)
-          next if raw.nil?
+          value = value_of(dto)
+          next if value.nil?
 
-          payload = CBOR.load(raw)
+          payload = value.first
           next if matches && !matches.call(payload, record["tags"] || {})
 
           price = bid.respond_to?(:call) ? Float(bid.call(payload)) : Float(bid)
@@ -607,7 +804,7 @@ module AgentSpaces
           now = now_ms
           current = claim_of(entry_id)
           next if current && current.fetch("expiresAtMillis", 0).to_i > now
-          next if (@states[entry_id] || {})["completed"]
+          next unless Peer.present?(@states[entry_id] || {}) # completed or withdrawn meanwhile
 
           epoch = current ? Integer(current["epoch"]) + 1 : 1
           claim = Wire.take_claim(entry_id, space_id, epoch, Wire.hlc_now(holder, now), holder, price,
@@ -621,8 +818,10 @@ module AgentSpaces
           pull_space_paced(space, settle_seconds)
           await_fold([settle_seconds, 0.3].min)
           winner = claim_of(entry_id)
+          # core cancel events, 2026-11-09: an entry completed or withdrawn during the settle
+          # window is nobody's, so a cancel that folded meanwhile leaves the take empty
           if winner && winner["holder"] == holder && Integer(winner["epoch"]) == epoch &&
-             !(@states[entry_id] || {})["completed"]
+             Peer.present?(@states[entry_id] || {})
             return entry_id
           end
         end
@@ -632,10 +831,14 @@ module AgentSpaces
     end
 
     # Completes a held entry: its state with the monotone completed flag set,
-    # re-signed by the holder and carrying the winning claim.
+    # re-signed by the holder and carrying the winning claim. An entry this
+    # replica holds completed or withdrawn is held by nobody, as Java's
+    # complete refuses it (core cancel events, 2026-11-09).
     def complete_entry(space, entry_id, agent: nil)
       check_fork!
       dto = @states.fetch(entry_id).dup
+      raise ArgumentError, "#{entry_id} is not held here: it is completed or withdrawn" unless Peer.present?(dto)
+
       dto["completed"] = true
       dto = Wire.sign_state(dto, @identity, agent, now_ms)
       @state_lock.synchronize { @states[entry_id] = dto }
@@ -643,6 +846,34 @@ module AgentSpaces
       send_frame("RUMOR", Wire.rumor_body("space:#{space}", "d:#{entry_id}", Wire::HOPS,
                                           CBOR.dump({ "state" => dto, "claimEntry" => proof ? entry_id : nil,
                                                       "claim" => proof })))
+    end
+
+    # Cancels an entry this peer (or agent) wrote, as Java's EntryHandle.cancel
+    # does (PDT 2 phase 7, P2-X-06): a state whose removes cover its adds,
+    # signed by the issuer, so every replica withdraws the entry; the replica
+    # keeps its tombstone until the collection horizon (SPEC 7.3). Watches
+    # here hear EXPIRED at once, and every other member's when the withdrawal
+    # folds there. An entry this replica holds completed or withdrawn stays as
+    # it is and nothing goes out, since an issuer's signature over a completed
+    # state verifies nowhere.
+    def cancel_entry(space, entry_id, agent: nil)
+      check_fork!
+      previous = @states.fetch(entry_id)
+      issuer = (previous["record"] || {})["issuer"].to_s
+      if agent && agent.agent_id != issuer
+        raise ArgumentError, "#{entry_id} was written by #{issuer}, not #{agent.agent_id}"
+      end
+      if agent.nil? && !issuer.start_with?("#{@identity.peer_id}/")
+        raise ArgumentError, "#{entry_id} was written by #{issuer}, not by this peer"
+      end
+      return unless Peer.present?(previous)
+
+      now = now_ms
+      dto = Wire.sign_state(previous.merge("removes" => union_dots(previous["removes"], previous["adds"])), @identity,
+                            agent, now)
+      merge_state(dto)
+      send_frame("RUMOR", Wire.rumor_body("space:#{space}", "x:#{entry_id}:#{now}", Wire::HOPS,
+                                          CBOR.dump({ "state" => dto, "claimEntry" => nil, "claim" => nil })))
     end
 
     # Renews this peer's write of an entry (SPEC 7.3); only the issuer renews.
@@ -734,30 +965,30 @@ module AgentSpaces
       maybe_session_hello(sender) if !relayed && sender != @identity.peer_id && !%w[RUMOR SESSION_HELLO].include?(kind)
       case kind
       when "SESSION_HELLO" then on_session_hello(env)
-      when "PING"
-        ping = CBOR.load(body)
-        send_frame("ACK", Wire.ack_body(ping.is_a?(Hash) ? ping.fetch("nonce", 0) : 0))
-      when "PIPE_DATA" then on_pipe(sender, CBOR.load(body))
+      when "PING" then send_frame("ACK", Wire.ack_body(Wire.decode_body(kind, body)["nonce"]))
+      when "PIPE_DATA" then on_pipe(sender, Wire.decode_body(kind, body))
       when "RELAY_FRAME"
-        relay = CBOR.load(body)
-        return unless relay.is_a?(Hash) && relay["target"] == @identity.peer_id
+        relay = Wire.decode_body(kind, body)
+        return unless relay["target"] == @identity.peer_id
 
         inner = Wire.decode_frame(relay["frame"] || "".b)
+        # HLC round four, 2026-11-08 (D3): an inner frame that does not
+        # decode counts as malformed, as one read from the connection does.
+        @malformed_frames += 1 if inner.nil?
         handle(inner, relayed: true) if inner && inner["kind"] != "RELAY_FRAME" && accepts?(inner)
       when "BLOCK_WANT"
-        want = CBOR.load(body)
-        data = want.is_a?(Hash) ? @blocks[want["cid"]] : nil
+        want = Wire.decode_body(kind, body)
+        data = @blocks[want["cid"]]
         send_addressed("BLOCK", Wire.block_body(want["cid"], data), sender) if data
       when "BLOCK"
-        block = CBOR.load(body)
-        if block.is_a?(Hash) && block["bytes"].is_a?(String) && @block_asked.key?(block["cid"]) &&
-           Wire.block_cid(block["bytes"]) == block["cid"]
+        block = Wire.decode_body(kind, body)
+        if block["bytes"].is_a?(String) && @block_asked.key?(block["cid"]) && Wire.block_cid(block["bytes"]) == block["cid"]
           @blocks[block["cid"]] = block["bytes"]
           wake_fold_waiters
         end
       when Wire::KIND_GROUP_AD then on_group_ad(body)
-      when "RUMOR" then on_rumor(CBOR.load(body))
-      when "PULL_RESP" then on_pull_resp(CBOR.load(body))
+      when "RUMOR" then on_rumor(Wire.decode_body(kind, body))
+      when "PULL_RESP" then on_pull_resp(Wire.decode_body(kind, body))
       else
         @ignored_kinds[kind.to_s] += 1
       end
@@ -774,6 +1005,119 @@ module AgentSpaces
     private
 
     def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    CARD_TYPES = %w[AppCard AgentCard].freeze
+    private_constant :CARD_TYPES
+
+    def positive!(value, name)
+      raise ArgumentError, "#{name} must be a positive integer: #{value.inspect}" unless value.is_a?(Integer) && value.positive?
+
+      value
+    end
+
+    def count(counter) = @state_lock.synchronize { instance_variable_set(counter, instance_variable_get(counter) + 1) }
+
+    # The card this peer signs (SPEC v0.1.32 §6.1a.2 and §6.1a.5; AppCard
+    # origin and formats, 2026-11-09). A dial-only client cannot see every
+    # member's hints, so its gate stays closed (FR-7): an AppCard leaves out
+    # origin, formats, and a host whose signOn is idp, and counts in
+    # app_cards_downgraded. It runs no content swarm, so it issues no stub,
+    # and a card past the spill threshold travels inline in full and counts
+    # in cards_oversize_inline (FR-12). A card past the warning threshold logs
+    # a warning once per id and size (FR-13). A card that breaks its schema
+    # raises Schema::Error.
+    def issue_card(ad_type, card)
+      raise ArgumentError, "this client runs no content swarm, so it issues no stub: #{card['id']}" if card.key?("spill")
+
+      # A card Java's constructors refuse reaches no reader, so it never goes out.
+      Schema.check(ad_type, card)
+      if ad_type == "AppCard"
+        stripped = Cards.without_gated_fields(card)
+        count(:@app_cards_downgraded) unless stripped == card
+        card = stripped
+      end
+      size = CBOR.dump(card).bytesize
+      warn_card_size(ad_type, card, size)
+      count(:@cards_oversize_inline) if size > Cards::CARD_SPILL_THRESHOLD_BYTES
+      card
+    end
+
+    def warn_card_size(ad_type, card, size)
+      return if size <= Cards::CARD_SPILL_WARN_BYTES
+
+      previous = @state_lock.synchronize do
+        held = @card_size_warned[card["id"]]
+        @card_size_warned[card["id"]] = size
+        held
+      end
+      return if previous == size
+
+      fate = if size <= Cards::CARD_SPILL_THRESHOLD_BYTES then "it travels inline until it passes the threshold"
+             else "it travels inline, since this client runs no content swarm"
+             end
+      kind = ad_type == "AppCard" ? "AppCard (kind #{card['kind']})" : ad_type
+      @logger&.warn("#{kind} #{card['id']} encodes to #{size} bytes, past the #{Cards::CARD_SPILL_WARN_BYTES}-byte " \
+                    "warning; the spill threshold is #{Cards::CARD_SPILL_THRESHOLD_BYTES} bytes, and #{fate}")
+    end
+
+    def complete_stub(card, spill, store)
+      document = store.get(spill["root"], spill["size"])
+      unless document.bytesize == spill["size"]
+        raise ArgumentError, "the parts document is #{document.bytesize} bytes; the stub states #{spill['size']}"
+      end
+      # This client runs no content swarm whose piece check would refuse other
+      # bytes, so it checks the root itself (AppCard origin and formats,
+      # 2026-11-09, FR-15).
+      root = Cards.content_root(document)
+      raise ArgumentError, "the parts document's content root #{root} is not spill.root" unless root == spill["root"]
+
+      kind = Cards.kind_of(card)
+      full = Cards.card_complete(card, Schema.load("#{kind}.Parts", document))
+      Schema.check(kind, full)
+      full
+    rescue ArgumentError, CBOR::Error => e
+      count(:@spills_refused)
+      raise ResolveError, "the parts document of #{card['id']} does not complete its stub: #{e.message}"
+    end
+
+    # The cache's admission (AdCache.admit; SPEC §6.3 v0.1.32, FR-11): a new id
+    # needs room under both bounds and a newer version room under the byte
+    # budget, judged again after the expired entries leave; a refusal keeps
+    # what the cache holds and counts. An older or equal version leaves the
+    # held one in place and counts nothing, as AdCache.admit does. Returns the
+    # held entry, or nil when the cache refused the advertisement.
+    def admit_ad(entry, issued)
+      id = entry["ad"]["id"]
+      held = @ads[id]
+      return held if held && Instants.parse_millis(held["ad"]["issued"]) >= issued
+
+      unless ad_fits?(id, entry)
+        evict_expired_ads
+        unless ad_fits?(id, entry)
+          @ads_refused_cache_full += 1
+          return nil
+        end
+      end
+      previous = @ads[id]
+      @ad_bytes += entry["bytes"] - previous.to_h["bytes"].to_i
+      @ads[id] = entry
+    end
+
+    def ad_fits?(id, entry)
+      previous = @ads[id]
+      return @ads.size < @ad_cache_max_entries && @ad_bytes + entry["bytes"] <= @ad_cache_max_bytes if previous.nil?
+
+      @ad_bytes - previous["bytes"].to_i + entry["bytes"] <= @ad_cache_max_bytes
+    end
+
+    def evict_expired_ads
+      now = now_ms
+      @ads.delete_if do |_, held|
+        expired = held["expires"] <= now
+        @ad_bytes -= held["bytes"].to_i if expired
+        expired
+      end
+    end
 
     def check_fork!
       return unless @inherited || Process.pid != @pid
@@ -821,6 +1165,7 @@ module AgentSpaces
       raise IOError, "no dialer serves the #{seed.scheme} scheme" if dialer.nil?
 
       @channel = dialer.open(seed, identity: @identity, timeout: timeout)
+      @link_since = monotonic
       @session = nil # a session ends with its connection
       @seed = seed
       @running = true
@@ -910,31 +1255,44 @@ module AgentSpaces
       index.nil? ? @seeds.dup : @seeds[(index + 1)..] + @seeds[0..index]
     end
 
-    # After a lost connection: dials again (every seed, the next first) until
-    # the window runs out, then re-introduces and re-pulls (ROBUSTNESS.md 3.6).
+    # After a lost connection: dials again (every seed, the next first), then
+    # re-introduces and re-pulls (ROBUSTNESS.md 3.6). The pauses between rounds
+    # back off from reconnect_interval to six times it (5, 10, 20, 30 s) with a
+    # random spread, so the clients of a seed that restarts do not all dial it at
+    # once, and the dials go on until the owner closes the peer (swarm retries,
+    # ROBUSTNESS.md 10.3 E5). A link that ended within reconnect_interval of
+    # its dial counts as a failed round, so a seed that accepts each dial and
+    # drops it at once gets the same pauses and no dial loop (ROBUSTNESS.md
+    # 10.6). A bootstrapped peer reads its beacon document again every
+    # reconnect_window with nothing reachable, and keeps the seeds it has when
+    # the beacon is unreachable too.
     def reconnect
+      if monotonic - @link_since < @reconnect_interval
+        @quick_drops += 1
+        sleep(reconnect_pause(@quick_drops))
+      else
+        @quick_drops = 0
+      end
       deadline = monotonic + @reconnect_window
-      refreshed = false
+      rounds = 0
       while @running
         if monotonic >= deadline
-          return false if refreshed || @refresh_seeds.nil?
-
-          refreshed = true
-          fresh = begin
-            expand_seeds(@refresh_seeds.call)
-          rescue StandardError
-            return false
-          end
-          return false if fresh.empty?
-
-          @seeds = fresh
           deadline = monotonic + @reconnect_window
+          unless @refresh_seeds.nil?
+            fresh = begin
+              expand_seeds(@refresh_seeds.call)
+            rescue StandardError
+              []
+            end
+            @seeds = fresh unless fresh.empty?
+          end
         end
         candidate_seeds.each do |seed|
           return false unless @running
 
           begin
             @channel = dialer_for(seed.scheme).open(seed, identity: @identity)
+            @link_since = monotonic
             @session = nil
           rescue SystemCallError, IOError, SocketError, OpenSSL::SSL::SSLError
             next
@@ -948,9 +1306,16 @@ module AgentSpaces
           @pulled_spaces.to_a.each { |space| pull_space(space) }
           return true
         end
-        sleep(@reconnect_interval)
+        rounds += 1
+        sleep(reconnect_pause(rounds))
       end
       false
+    end
+
+    # The pause after the rounds-th failed round of dials: reconnect_interval
+    # doubling to six times it, with a random spread of up to a quarter.
+    def reconnect_pause(rounds)
+      [6 * @reconnect_interval, @reconnect_interval * (2**[rounds - 1, 3].min)].min * (1 + (rand / 4))
     end
 
     def notify_observers
@@ -1026,11 +1391,8 @@ module AgentSpaces
     end
 
     def on_pipe(sender, frame)
-      return unless frame.is_a?(Hash)
-
       if frame["capability"] == Wire::RELAY_SIGNAL_CAPABILITY
-        signal = CBOR.load(frame["payload"] || "\xF6".b)
-        @relay_signals << signal if signal.is_a?(Hash)
+        @relay_signals << Schema.load("PeerNode.RelaySignal", frame["payload"])
         @relay_signals.shift while @relay_signals.size > 64
         return
       end
@@ -1038,18 +1400,16 @@ module AgentSpaces
     end
 
     def on_rumor(rumor)
-      return unless rumor.is_a?(Hash)
-
       stream = rumor["streamId"].to_s
       if Revocation::STREAMS.include?(stream)
         @revocations.accept(stream, rumor["payload"], now_ms)
       elsif stream == "peers"
-        accept_peer_ad(rumor["payload"] || "".b)
+        accept_peer_ad(rumor["payload"])
       elsif stream == "ads"
-        accept_ad(CBOR.load(rumor["payload"] || "\xF6".b))
+        accept_ad(CBOR.load(rumor["payload"]))
       elsif stream.start_with?("space:")
-        delta = CBOR.load(rumor["payload"] || "\xF6".b)
-        return unless delta.is_a?(Hash)
+        delta = space_delta(rumor["payload"], "SpaceWire.Delta")
+        return if delta.nil?
 
         # Claim before state: a completion authenticates against the claim.
         fold_claim(delta["claimEntry"], delta["claim"]) if delta["claimEntry"] && delta["claim"].is_a?(Hash)
@@ -1057,25 +1417,82 @@ module AgentSpaces
       end
     end
 
+    # One delta per stream. A delta that does not decode drops alone, and
+    # the peer folds the rest of the response (HLC round four, 2026-11-08 (D5)):
+    # a space delta counts in deltas_undecodable, any other in malformed_frames.
     def on_pull_resp(resp)
-      return unless resp.is_a?(Hash)
+      resp["deltas"].each do |stream, delta_bytes|
+        next if delta_bytes.empty?
 
-      (resp["deltas"] || {}).each do |stream, delta_bytes|
-        next if delta_bytes.nil? || delta_bytes.empty?
+        if stream.start_with?("space:")
+          sync = space_delta(delta_bytes, "SpaceWire.SyncDelta")
+          next if sync.nil?
 
-        if Revocation::STREAMS.include?(stream)
-          Array(CBOR.load(delta_bytes)).each { |signed| @revocations.accept_signed(stream, signed, now_ms) }
-        elsif stream == "ads"
-          delta = CBOR.load(delta_bytes)
-          Array(delta.is_a?(Hash) ? delta["ads"] : nil).each { |stored| accept_ad(stored) }
-        elsif stream.to_s.start_with?("space:")
-          sync = CBOR.load(delta_bytes)
-          next unless sync.is_a?(Hash)
+          (sync["claims"] || {}).each { |entry_id, signed| fold_claim(entry_id, signed) }
+          (sync["states"] || []).each { |dto| fold_state(dto) }
+          next
+        end
+        record = PULL_DELTAS[stream]
+        next if record.nil?
 
-          (sync["claims"] || {}).each { |entry_id, signed| fold_claim(entry_id, signed) if signed.is_a?(Hash) }
-          Array(sync["states"]).each { |dto| fold_state(dto) if dto.is_a?(Hash) }
+        delta = begin
+          Schema.load(record, delta_bytes)
+        rescue CBOR::Error
+          @malformed_frames += 1
+          next
+        end
+        if stream == "ads"
+          (delta["ads"] || []).each { |stored| accept_ad(stored) }
+        else
+          (delta || []).each { |signed| @revocations.accept_signed(stream, signed, now_ms) }
         end
       end
+    end
+
+    # A space delta decoded from bytes under record (SpaceWire.Delta from a
+    # RUMOR, SpaceWire.SyncDelta from a PULL_RESP), or nil, counted in
+    # deltas_undecodable, when it does not decode, so the whole carrier drops
+    # as Java's ReplicatedSpace drops it (HLC round four, 2026-11-08 (D3, D5)).
+    # HLC round six, 2026-11-08 (F1, F3): it decodes only in the wire
+    # encoding and under its record, each stamp a canonical stamp, each
+    # agent id in the AgentId grammar, and each number in its declared type.
+    def space_delta(bytes, record)
+      delta = Schema.load(record, bytes)
+      prune_claims
+      delta
+    rescue CBOR::Error
+      count_undecodable
+    end
+
+    # HLC round six, 2026-11-08 (R10): drops each claim on an entry this
+    # replica does not hold once the claim's expiry passes, so claims on
+    # entries it never held (this peer collects no entry) cannot grow the
+    # claim map without bound. It runs between carriers, never inside one, so
+    # a completion still finds the claim it travels with, and it runs when
+    # the map has doubled since the last pass, so the work stays proportional
+    # to the claims folded.
+    def prune_claims
+      @state_lock.synchronize do
+        next if @claims.size < @claims_prune_at
+
+        now = now_ms
+        @claims.delete_if { |entry_id, signed| !@states.key?(entry_id) && signed["claim"]["expiresAtMillis"] <= now }
+        @claims_prune_at = [2 * @claims.size, CLAIMS_PRUNE_FLOOR].max
+      end
+    end
+
+    # Whether a decoded value holds to a record of the wire encoding (HLC
+    # round six, 2026-11-08, F1 and F3).
+    def decodes?(record, value)
+      Schema.check(record, value)
+      true
+    rescue CBOR::Error
+      false
+    end
+
+    def count_undecodable
+      @state_lock.synchronize { @deltas_undecodable += 1 }
+      nil
     end
 
     # A GROUP_AD answer: accepted only while a join by GroupID is pending and
@@ -1084,7 +1501,7 @@ module AgentSpaces
       @founding_lock.synchronize do
         return unless @founding.nil?
 
-        signed = CBOR.load(body)
+        signed = Wire.decode_body(Wire::KIND_GROUP_AD, body)
         return unless Founding.verify(signed) == @group
 
         @founding = signed
@@ -1092,14 +1509,16 @@ module AgentSpaces
       end
     end
 
+    # HLC round six, 2026-11-08 (F3): the SignedPeerAd and its
+    # PeerAdvertisement hold to their records (ad-02 to ad-06).
     def accept_peer_ad(payload)
-      signed = CBOR.load(payload)
-      ad_bytes = signed.fetch("adBytes")
-      key = signed.fetch("publicKey")
-      return unless Crypto.port.verify(key, ad_bytes, signed.fetch("signature"))
+      signed = Schema.load("PeerNode.SignedPeerAd", payload)
+      ad_bytes = signed["adBytes"]
+      key = signed["publicKey"]
+      return unless key&.bytesize == 32 && Crypto.port.verify(key, ad_bytes, signed["signature"])
 
-      ad = CBOR.load(ad_bytes)
-      return unless ad.is_a?(Hash) && ad["issuer"] == Derive.id(key) && ad["issuer"] != @identity.peer_id
+      ad = Schema.load("PeerAdvertisement", ad_bytes)
+      return unless ad["issuer"] == Derive.id(key) && ad["issuer"] != @identity.peer_id
 
       @members[ad["issuer"]] = ad
       if @channel_auth == :session && (ad["resourceHints"] || {})[Session::HINT] == "1"
@@ -1107,7 +1526,7 @@ module AgentSpaces
       else
         @session_peers.delete(ad["issuer"])
       end
-    rescue CBOR::Error, KeyError, TypeError, NoMethodError
+    rescue CBOR::Error, TypeError
       nil
     end
 
@@ -1124,37 +1543,100 @@ module AgentSpaces
     end
 
     # Whether an incoming lease stamp supersedes the held one. fold_state
-    # admits only stamps the strict parser accepts, and a state without a
-    # lease stamp keeps the held lease.
+    # admits only stamps the strict parser accepts, and only states that
+    # carry a lease stamp (HLC round five, 2026-11-08 (E7)).
     def lease_newer?(incoming, held)
-      return false if incoming.nil?
-      return true if held.nil?
-
       (Wire.hlc_order(incoming) <=> Wire.hlc_order(held)).positive?
     end
 
     # HLC logical counter, 2026-11-08 (Rust team report): the stamps a state
-    # feeds the clock, as ReplicatedSpace.stampsAcceptable reads them. The
-    # record's issue stamp is required and the lease stamp optional. signedAt
-    # never reaches a clock, so verification decodes it and nothing judges it
-    # against the logical limit, as in Java (HLC canonical stamps, 2026-11-08).
+    # carries, as ReplicatedSpace.stampsAcceptable reads them. The record's
+    # issue stamp is required, and the lease stamp and an agent-signed
+    # state's signedAt are judged when present: signedAt is a stamp like any
+    # other (HLC round four, 2026-11-08 (D1)).
     def state_stamps_acceptable?(dto, record)
-      Wire.hlc_acceptable?(record["issued"]) && (dto["leaseStamp"].nil? || Wire.hlc_acceptable?(dto["leaseStamp"]))
+      Wire.hlc_acceptable?(record["issued"]) &&
+        %w[leaseStamp signedAt].all? { |field| dto[field].nil? || Wire.hlc_acceptable?(dto[field]) }
     end
 
-    # Counts a verified state or claim refused for its stamp, once per
-    # distinct offer: a partner re-offering it every anti-entropy round counts
-    # once (HLC canonical stamps, 2026-11-08).
-    def refuse_stamp(kind, offered)
-      key = "#{kind}:#{Crypto.port.sha256(CBOR.dump(offered)).unpack1('H*')}"
-      @state_lock.synchronize do
-        next if @refused_offers.key?(key)
+    # The latest of the stamps the far-future rule judges in a state: the
+    # record's issue stamp, the lease stamp, and an agent-signed state's
+    # signedAt (HLC round six, 2026-11-08 (F4)), which the certificate's
+    # drift ceiling no longer judges in verify_state.
+    def state_lead_ms(dto, record)
+      [record["issued"], dto["leaseStamp"], dto["signedAt"]].compact.map { |stamp| Wire.hlc_physical(stamp) }.max
+    end
 
-        @refused_offers[key] = true
-        @refused_offers.shift if @refused_offers.size > REFUSED_STAMP_MEMORY
-        @refused_stamps[kind] += 1
+    # The key a state offer is judged under: its entry id, its issue stamp,
+    # and its signed view, as Java's stateOfferKey builds it (HLC round four,
+    # 2026-11-08 (D5)).
+    def state_offer_key(dto, record)
+      view = Crypto.port.sha256(state_view_bytes(dto, record)).unpack1("H*")
+      "state:#{record['entryId']}=#{record['issued']}/#{view}"
+    end
+
+    # The key a claim offer is judged under: its encoding and its entry id,
+    # as Java's claimOfferKey builds it (HLC round four, 2026-11-08 (D5)).
+    def claim_offer_key(entry_id, claim)
+      "claim:#{Crypto.port.sha256(CBOR.dump(claim)).unpack1('H*')}@#{entry_id}"
+    end
+
+    # Counts a verified state refused for its stamps, under reason :logical
+    # or :far_future.
+    def refuse_state(dto, record, reason) = refuse_offer(state_offer_key(dto, record), reason)
+
+    # Counts a verified claim refused for its stamp, under reason :logical
+    # or :far_future.
+    def refuse_claim(entry_id, claim, reason) = refuse_offer(claim_offer_key(entry_id, claim), reason)
+
+    # Counts one refusal once per distinct offer: a partner re-offering it
+    # every anti-entropy round, or a relay re-encoding its unsigned content,
+    # counts once (HLC canonical stamps, 2026-11-08). HLC round five,
+    # 2026-11-08 (E2): a logical refusal counts in stamps_logical_refused and
+    # a hostile far-future one in stamps_far_future_refused.
+    def refuse_offer(key, reason)
+      return unless remember_offer(@refused_offers, key)
+
+      @state_lock.synchronize do
+        if reason == :logical
+          @stamps_logical_refused += 1
+        else
+          @stamps_far_future_refused += 1
+        end
       end
       nil
+    end
+
+    # Counts one deferral once per distinct offer, so a partner re-offering
+    # it every round before the wall catches up counts once (HLC round five,
+    # 2026-11-08 (E2)).
+    def defer_offer(key)
+      @state_lock.synchronize { @stamps_far_future_deferred += 1 } if remember_offer(@deferred_offers, key)
+      nil
+    end
+
+    # Records key in memory and returns whether it was new. A key offered
+    # again moves to the young end, and past REFUSED_STAMP_MEMORY keys the
+    # least recently offered one leaves (HLC round five, 2026-11-08 (E14)).
+    # The peer judges every offer afresh; the memory only stops a second
+    # count (HLC round five, 2026-11-08 (E5)).
+    def remember_offer(memory, key)
+      @state_lock.synchronize do
+        if memory.key?(key)
+          memory[key] = memory.delete(key)
+          next false
+        end
+        memory[key] = true
+        memory.shift if memory.size > REFUSED_STAMP_MEMORY
+        true
+      end
+    end
+
+    # The bytes a state's signature covers (StateSignView).
+    def state_view_bytes(dto, record)
+      CBOR.dump(Wire.state_sign_view(record["spaceId"], record["entryId"], dto["adds"] || [], dto["removes"] || [],
+                                     dto["leaseStamp"], dto["leaseValue"], dto["completed"] ? true : false,
+                                     dto["signer"], dto["signedAt"]))
     end
 
     def union_dots(left, right)
@@ -1169,12 +1651,21 @@ module AgentSpaces
     # signature. The party is the claim holder for a completion and the
     # issuer otherwise; an agent-attested party's transitions must be
     # agent-signed (A6, v0.1.13).
+    # Whether every dot of a state names its record issuer's peer as the
+    # replica, as Java's ReplicatedSpace.dotsBoundToIssuer requires (ASF-025):
+    # a writer adds and removes only its own dots, so a state whose dots name
+    # another replica drops uncounted (HLC round six, 2026-11-08, reference
+    # rule; vector delta-13).
+    def dots_bound_to_issuer?(dto, record)
+      issuer_peer = record["issuer"].to_s.split("/", 2).first
+      (Array(dto["adds"]) + Array(dto["removes"])).all? { |dot| dot.is_a?(Hash) && dot["replica"] == issuer_peer }
+    end
+
     def verify_state(dto, record)
       issuer_key = dto["issuerPublicKey"]
       return false unless issuer_key.is_a?(String) && issuer_key.bytesize == 32
 
-      now = now_ms
-      return false unless Wire.verify_record(record, issuer_key, dto["agentCertificate"], now)
+      return false unless Wire.verify_record(record, issuer_key, dto["agentCertificate"])
 
       state_sig = dto["stateSig"]
       return false unless state_sig.is_a?(String)
@@ -1185,7 +1676,7 @@ module AgentSpaces
 
         claim = signed["claim"] || {}
         return false unless claim["entryId"] == record["entryId"] && claim["spaceId"] == record["spaceId"]
-        return false unless Wire.verify_claim_proof(signed, now)
+        return false unless Wire.verify_claim_proof(signed)
 
         signer_key = signed["holderKey"]
         party = claim["holder"]
@@ -1198,15 +1689,12 @@ module AgentSpaces
       return false unless signer_key.is_a?(String) && signer_key.bytesize == 32
 
       signer = dto["signer"]
-      signed_at = dto["signedAt"]
-      view = CBOR.dump(Wire.state_sign_view(record["spaceId"], record["entryId"], dto["adds"] || [],
-                                            dto["removes"] || [], dto["leaseStamp"], dto["leaseValue"],
-                                            dto["completed"] ? true : false, signer, signed_at))
+      view = state_view_bytes(dto, record)
       unless signer.nil?
         certificate = dto["stateCertificate"]
-        signed_ms = Wire.hlc_physical(signed_at)
+        signed_ms = Wire.hlc_physical(dto["signedAt"])
         return signer == party && certificate.is_a?(Hash) &&
-               Certificates.verify_at(certificate, signer_key, party, signed_ms, now) &&
+               Certificates.verify_covering(certificate, signer_key, party, signed_ms) &&
                Crypto.port.verify(certificate["agentPublicKey"], view, state_sig)
       end
       return false if party_attested
@@ -1248,8 +1736,9 @@ module AgentSpaces
     def available(type_name, now)
       @states.to_a.select do |entry_id, dto|
         record = dto["record"] || {}
-        next false unless record["type"] == type_name && !dto["completed"]
-        next false if (record["lease"] || {}).fetch("expiresAtMillis", 0).to_i <= now
+        # completed, or withdrawn by a cancel (core cancel events, 2026-11-09)
+        next false unless record["type"] == type_name && Peer.present?(dto)
+        next false if Peer.lease_of(dto).fetch("expiresAtMillis", 0).to_i <= now
 
         claim = claim_of(entry_id)
         !(claim && claim.fetch("expiresAtMillis", 0).to_i > now)

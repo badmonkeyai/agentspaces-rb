@@ -85,12 +85,17 @@ module AgentSpaces
     REQUIRED = Object.new.freeze
     DURATIONS = %i[lease poll_timeout result_lease within].freeze
     COMMON_RESULT = { result_space: nil, result_lease: "1h", produces: nil }.freeze
+    # The action's contract for a planner (SPEC 6.1b), on the verbs whose Java
+    # annotation declares it; the card carries it when any term is set.
+    CONTRACT = { pre: nil, post: nil, cost: "" }.freeze
+    CONTRACT_TERMS = 32
+    COST_LENGTH = 64
 
     # The accepted options per verb, with defaults; REQUIRED marks the ones a
     # clause must name. Derived from the Java annotations' attributes.
     OPTIONS = {
       take: { space: REQUIRED, group: nil, lease: "10m", poll_timeout: "1s", tags: nil, where: nil, description: "",
-              **COMMON_RESULT },
+              **CONTRACT, **COMMON_RESULT },
       notify: { space: REQUIRED, group: nil, on: WRITTEN, lease: "1h", tags: nil, where: nil, description: "",
                 **COMMON_RESULT },
       bid: { space: REQUIRED, group: nil },
@@ -102,7 +107,7 @@ module AgentSpaces
               max_open: 10_000, description: "", **COMMON_RESULT },
       on_estimate: { epochs: "", ticks: 0, tolerance: 0.0, **COMMON_RESULT },
       ordered_take: { space: REQUIRED, group: nil, lease: "30s", poll_timeout: "2s", tags: nil, where: nil,
-                      description: "", **COMMON_RESULT },
+                      description: "", **CONTRACT, **COMMON_RESULT },
       # The accumulator lives in the reduce's own space, so no result_space.
       reduce: { space: REQUIRED, group: nil, key: nil, key_tag: nil, mode: "leased", lease: "30s", poll_timeout: "1s",
                 tags: nil, where: nil, max_open: 10_000, description: "", produces: nil }
@@ -285,6 +290,16 @@ module AgentSpaces
               raise DefinitionError.new("join part type #{part.type.inspect} is not an Entry class", location)
             end
           end
+        end
+        %i[pre post].each do |key|
+          terms = merged[key]
+          next if terms.nil? || (terms.is_a?(Array) && terms.size <= CONTRACT_TERMS && terms.all?(String))
+
+          raise DefinitionError.new("#{key} #{terms.inspect} is not a list of at most #{CONTRACT_TERMS} texts", location)
+        end
+        if merged.key?(:cost) && !(merged[:cost].is_a?(String) && merged[:cost].length <= COST_LENGTH)
+          raise DefinitionError.new("cost is a text of at most #{COST_LENGTH} characters, got #{merged[:cost].inspect}",
+                                    location)
         end
         Array(merged[:produces]).each do |type|
           next if Entry.entry_class?(type) || type.is_a?(String)

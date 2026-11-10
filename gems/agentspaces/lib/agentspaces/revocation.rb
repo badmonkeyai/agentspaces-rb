@@ -29,6 +29,8 @@ module AgentSpaces
     KEY_COMPROMISE = "key-compromise"
     REASONS = [KEY_COMPROMISE, "retired", "superseded", "privilege-withdrawn", "unspecified"].freeze
     KINDS = %w[AGENT AGENT_KEY X509_LEAF JOIN_CREDENTIAL].freeze
+    # The record each stream's adBytes holds (HLC round six, 2026-11-08, F3).
+    RECORDS = { PEER_STREAM => "RevocationAdvertisement", CREDENTIAL_STREAM => "CredentialRevocation" }.freeze
     FOUNDER = 3
     OWN_PEER = 1
     MAX_ISSUED_SKEW_MILLIS = 10 * 60 * 1000
@@ -78,22 +80,23 @@ module AgentSpaces
       # Verifies and accepts one rumor payload (a CBOR SignedRevocation).
       def accept(stream, payload, now_ms)
         accept_signed(stream, CBOR.load(payload), now_ms)
-      rescue CBOR::Error, ArgumentError, TypeError
+      rescue CBOR::Error
         false
       end
 
       # Verifies and accepts one decoded SignedRevocation; returns whether it
-      # newly revoked its target.
+      # newly revoked its target. HLC round six, 2026-11-08 (F1, F3): the
+      # SignedRevocation and its adBytes hold to their records, and one that
+      # does not is undecodable and accepts nothing.
       def accept_signed(stream, signed, now_ms)
-        return false unless signed.is_a?(Hash)
+        record = RECORDS[stream]
+        return false if record.nil?
 
-        ad_bytes = signed["adBytes"]
-        key = signed["publicKey"]
-        signature = signed["signature"]
-        return false unless ad_bytes.is_a?(String) && key.is_a?(String) && key.bytesize == 32 && signature.is_a?(String)
+        Schema.check("RevocationRegistry.SignedRevocation", signed)
+        ad_bytes, key, signature = signed.values
+        return false unless ad_bytes && signature && key&.bytesize == 32
 
-        ad = CBOR.load(ad_bytes)
-        return false unless ad.is_a?(Hash)
+        ad = Schema.load(record, ad_bytes)
 
         issued = Instants.parse_millis(ad["issued"])
         return false unless Derive.id(key) == ad["issuer"]
@@ -104,12 +107,8 @@ module AgentSpaces
         return false unless group.nil? || group == ad["group"]
 
         digest = Crypto.port.sha256(ad_bytes).unpack1("H*")
-        case stream
-        when PEER_STREAM then accept_peer(ad, issued, digest)
-        when CREDENTIAL_STREAM then accept_credential(ad, issued, digest)
-        else false
-        end
-      rescue CBOR::Error, ArgumentError, TypeError, NoMethodError
+        stream == PEER_STREAM ? accept_peer(ad, issued, digest) : accept_credential(ad, issued, digest)
+      rescue ArgumentError, TypeError, NoMethodError
         false
       end
 

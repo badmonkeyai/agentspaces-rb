@@ -25,10 +25,19 @@ module AgentSpaces
     module Values
       module_function
 
-      # The canonical CBOR of a key the CHAMP hashes.
-      def encode_value(value) = value.is_a?(Raw) ? value.bytes : CBOR.dump(value)
+      # The canonical CBOR of a key the CHAMP hashes, or of a value a writer
+      # stores: a PText in its value form (PDT 2 phase 7, P2-T-05).
+      def encode_value(value)
+        case value
+        when Raw then value.bytes
+        when PText then value.to_wire
+        else CBOR.dump(value)
+        end
+      end
 
-      def decode_value(bytes) = CBOR.load(bytes)
+      # A value from its CBOR item; a text in its value form reads as a PText
+      # (PDT 2 phase 7, P2-C-02, P2-T-05), with no replica until a writer names one.
+      def decode_value(bytes) = PText.value?(bytes) ? PText.of(PText.leaf_of(bytes)) : CBOR.load(bytes)
 
       # A key or value given as exact CBOR bytes, for a form CBOR.dump does not
       # produce (a 32-bit float, a definite map).
@@ -53,6 +62,8 @@ module AgentSpaces
         when Nodes::KIND_M then reassemble_map(ChampNode.load_root(cid, data), loader, depth)
         when Nodes::KIND_VR then reassemble_array(VecRoot.decode(cid, data), loader, depth)
         when Nodes::KIND_B then byte_string(read_blob(cid, data, loader))
+        # PDT 2 phase 7 (P2-T-05): a text spilled to its t node reads as its value form
+        when Nodes::KIND_T then PText.to_wire(TextLeaf.decode(data, cid))
         else raise NodeFormatError.new("a spilled value cannot be a node of kind '#{Nodes.kind_of(data)}'", cid)
         end
       end

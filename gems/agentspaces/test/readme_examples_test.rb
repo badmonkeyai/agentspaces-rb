@@ -16,7 +16,7 @@
 
 require_relative "test_helper"
 
-# The README's "How to use AI with AgentSpaces" snippets, each the body of one
+# The "How to use AI with AgentSpaces" snippets (docs/how-to-use-ai.md), each the body of one
 # test here (SRAD RB-O-01): an agent that completes work another peer writes,
 # a crashed worker whose task reappears, and a vote two agents decide.
 class ReadmeExamplesTest < Minitest::Test

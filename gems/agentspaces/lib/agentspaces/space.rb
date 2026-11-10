@@ -199,15 +199,16 @@ module AgentSpaces
       found = []
       @peer.states.to_a.each do |entry_id, dto|
         record = dto["record"] || {}
-        next unless record["type"] == template.schema && mine?(dto) && !dto["completed"]
+        # completed, or withdrawn by a cancel (core cancel events, 2026-11-09)
+        next unless record["type"] == template.schema && mine?(dto) && Peer.present?(dto)
 
-        lease = record["lease"] || {}
+        lease = Peer.lease_of(dto)
         next if lease.fetch("expiresAtMillis", 0).to_i <= now
 
-        raw = @peer.payload_of(dto)
-        next if raw.nil?
+        value = @peer.value_of(dto)
+        next if value.nil?
 
-        payload = CBOR.load(raw)
+        payload = value.first
         tags = record["tags"] || {}
         next unless template.matches(payload, tags)
 
@@ -274,7 +275,7 @@ module AgentSpaces
       return nil if entry_id.nil?
 
       dto = @peer.states.fetch(entry_id)
-      taken = Taken.new(self, entry_id, template.decode(CBOR.load(@peer.payload_of(dto) || "\xF6".b)), millis)
+      taken = Taken.new(self, entry_id, template.decode(@peer.value_of(dto)&.first), millis)
       return taken if block.nil?
 
       result = TakeContext.with(taken) { block.call(taken.value, taken) }
@@ -340,12 +341,23 @@ module AgentSpaces
     def state_folded(dto)
       return unless mine?(dto)
 
-      deliver(dto, dto["completed"] ? COMPLETED : WRITTEN)
+      if dto["completed"]
+        deliver(dto, COMPLETED)
+      elsif Peer.present?(dto)
+        deliver(dto, WRITTEN) # a withdrawn entry learned late is history, not news
+      end
+    end
+
+    # EXPIRED for a cancel that withdrew an entry present here, the kind Java's
+    # ReplicatedSpace and LocalSpace raise for a cancel, once per entry with the
+    # sweep's (core cancel events, 2026-11-09).
+    def state_withdrawn(dto)
+      deliver(dto, EXPIRED) if mine?(dto)
     end
 
     def claim_folded(entry_id, _signed)
       dto = @peer.states[entry_id]
-      return if dto.nil? || !mine?(dto) || dto["completed"]
+      return if dto.nil? || !mine?(dto) || !Peer.present?(dto)
 
       deliver(dto, TAKEN)
     end
@@ -361,9 +373,10 @@ module AgentSpaces
       return if @watchers.empty?
 
       @peer.states.to_a.each do |entry_id, dto|
-        next if !mine?(dto) || dto["completed"]
+        # a cancel already delivered a withdrawn entry's EXPIRED (core cancel events, 2026-11-09)
+        next if !mine?(dto) || !Peer.present?(dto)
 
-        lease = (dto["record"] || {})["lease"] || {}
+        lease = Peer.lease_of(dto)
         if lease.fetch("expiresAtMillis", 0).to_i <= now
           deliver(dto, EXPIRED)
           next
@@ -388,10 +401,10 @@ module AgentSpaces
       return if @watchers.empty?
 
       record = dto["record"] || {}
-      raw = @peer.payload_of(dto)
-      return if raw.nil?
+      value = @peer.value_of(dto)
+      return if value.nil?
 
-      payload = CBOR.load(raw)
+      payload = value.first
       tags = record["tags"] || {}
       now = @peer.now_ms
       @watchers.values.each do |template, callback, delivered, subscription, wanted|
@@ -407,9 +420,11 @@ module AgentSpaces
 
         value = decode_or_nil(template, payload)
         next if value.nil? || !template.accepts?(value)
+        # the fold and the sweep thread both deliver EXPIRED, for a cancel and for a lapse:
+        # one claims the mark (core cancel events, 2026-11-09)
+        next unless @lock.synchronize { delivered.add?(seen) }
 
-        delivered << seen
-        lease = record["lease"] || {}
+        lease = Peer.lease_of(dto)
         item = Item.new(entry_id: record["entryId"], value: value, tags: tags.dup.freeze, issuer: record["issuer"],
                         expires_at_millis: lease.fetch("expiresAtMillis", 0).to_i, completed: kind == COMPLETED,
                         taken: kind == TAKEN)

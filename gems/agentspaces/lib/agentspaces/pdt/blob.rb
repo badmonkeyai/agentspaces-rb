@@ -20,7 +20,7 @@ module AgentSpaces
     # PD-B-07, PD-C-06): a raw chunk when the blob has one chunk, else a
     # prolly tree of {k:"b", h, c, z} nodes over raw chunks. A read seeks by
     # the z sums and loads only the chunks that hold the range; every chunk
-    # is checked against the length the tree claims. The Ruby face reads only.
+    # is checked against the length the tree claims; Build.blob writes one.
     class PBlob
       Entry = Struct.new(:cid, :length)
       Located = Struct.new(:cid, :start, :length)
@@ -84,6 +84,11 @@ module AgentSpaces
       end
 
       def read_all = chunks.map { |e| chunk(e) }.join.b
+
+      # The bytes of a range verified 16 KiB group by group against a BlobIdentity
+      # through its Bao outboard (PDT 2 phase 7, P2-C-02); VerificationError names a
+      # node or a group that does not verify.
+      def read_verified(offset, length, claim) = VerifiedWindow.read(self, claim, offset, length)
 
       def ==(other) = other.is_a?(PBlob) && other.root == root
       alias eql? ==

@@ -1056,6 +1056,9 @@ class PdtTest < Minitest::Test
 
     def refuse! = @refuse = true
 
+    # Answers nothing, as a member that is busy or out of reach.
+    def mute! = @mute = true
+
     # Answers every NODE_WANT with whatever it holds, asked for or not.
     def forge! = @forge = true
 
@@ -1078,6 +1081,8 @@ class PdtTest < Minitest::Test
     end
 
     def answer(msg)
+      return if @mute
+
       case msg["t"]
       when Tree::NODE_WANT
         return reply(Tree.reject(msg["cids"].first, Tree::TREE_INDEX, 1)) if @refuse
@@ -1317,6 +1322,72 @@ class PdtTest < Minitest::Test
     assert_equal({ "a" => 10, "b" => 20 }, facts.deref.to_h, "past the backoff the walk reaches the base")
   ensure
     swap_const(Refs, :RETRY_BASE, retry_base)
+  end
+
+  # Chain walk sources (srad/agentspaces-pdt2.md 10.20): a reader meets the
+  # heads h, over p, and k, over the base, before any entry of p, and h's
+  # writer c has yet to fetch p's vg node, so the base's own writer b alone
+  # holds it. The walk asks the heads' writers first and then the writer of
+  # every version this reader knows, as Java's Refs.chainSources does, so it
+  # asks b before the member that stays silent and merges against the base.
+  # It asked the heads' writers and the writers of the nodes it read, then
+  # every member in member order, so the silent member held the batch past
+  # the load timeout and the later head won whole.
+  def test_a_walk_reads_a_chain_node_the_heads_writers_lack_from_the_writer_of_a_version_the_reader_knows
+    peer = peer_at(T0)
+    pdt = Pdt.new(peer, space: "pdt", load_timeout: 0.5)
+    c, a, silent, b = Array.new(4) { FakeHolder.new(peer, pdt.trees, NodeStore.new) }
+    silent.mute!
+    facts = concurrent_heads(peer, pdt, a: a, b: b, c: c)
+    assert_equal({ "a" => "base", "b" => "p", "x" => "h", "y" => "k" }, facts.deref.to_h)
+    assert_empty facts.conflicts
+    assert_equal 0, pdt.stats["chainNodesMissed"]
+    assert silent.frames.none? { |f| f[2]["t"] == Tree::NODE_WANT }, "the walk reached b before the silent member"
+  end
+
+  # Chain walk sources, the gate of srad/agentspaces-pdt2.md 10.20: a vg node
+  # that is late in a walk stays the version's vg node. A writer whose merge
+  # could not fetch h's node forgot which node describes h, so the version it
+  # wrote next linked no node for that base and the chain broke there for good.
+  def test_a_writer_whose_walk_missed_a_heads_chain_node_still_links_it_from_the_version_it_writes
+    peer, = AgentSpaces::Testing::Network.fleet("zRubyChainWalk", 1)
+    pdt = Pdt.new(peer, space: "pdt", load_timeout: 0.5)
+    c, a, b = Array.new(3) { FakeHolder.new(peer, pdt.trees, NodeStore.new) }
+    facts = concurrent_heads(peer, pdt, a: a, b: b, c: c)
+    vg_h = Ancestry.cid(Refs.decode(peer.payload_of(peer.states.fetch("e-h"))))
+    vg_k = Ancestry.cid(Refs.decode(peer.payload_of(peer.states.fetch("e-k"))))
+    c.mute! # h's vg node is late: its holder answers only after the merge gave up on it
+    facts.swap { |m| m.merge("w" => "w") }
+    assert_operator pdt.stats["chainNodesMissed"], :>, 0, "the merge walked without h's vg node"
+    head = Refs.decode(peer.payload_of(peer.states.values.find { |dto| dto.dig("record", "issuer").start_with?(peer.identity.peer_id) }))
+    node = Ancestry.node(Ancestry.cid(head), head["root"], pdt.store.get(Ancestry.cid(head)))
+    assert_equal [vg_h, vg_k].sort, node.previous.map(&:cid).sort, "the version links the vg node of each base it merged"
+  end
+
+  # The live heads of the two tests above: b wrote the base, which the reader
+  # knows, and p over it, which the reader never saw; c wrote h over p, its vg
+  # node linking p's, which only b holds; a wrote k over the base. The reader
+  # holds the trees of the base, h and k.
+  def concurrent_heads(peer, pdt, a:, b:, c:)
+    base = map_node(pdt.store, { "a" => "base" })
+    p = map_node(NodeStore.new, { "a" => "base", "b" => "p" })
+    h = map_node(pdt.store, { "a" => "base", "b" => "p", "x" => "h" })
+    k = map_node(pdt.store, { "a" => "base", "y" => "k" })
+    vg = lambda do |holder, root, bases, links, step|
+      holder.store.put(VgNode.new(root, bases, "#{holder.id}/app", "#{peer.now_ms + step}:0:golden",
+                                  links.map { |l| Nodes::Link.new(l) }).encode)
+    end
+    vg_base = vg.call(b, base, [], [], 0)
+    vg_p = vg.call(b, p, [base], [vg_base], 1)
+    [a, c].each { |holder| holder.store.put(b.store.get(vg_base)) }
+    { "e-base" => [b, base, [], vg_base, 1, 1], "e-k" => [a, k, [base], vg.call(a, k, [base], [vg_base], 2), 2, 2],
+      "e-h" => [c, h, [p], vg.call(c, h, [p], [vg_p], 3), 3, 3] }.each do |entry_id, (holder, root, bases, link, step, size)|
+      peer.states[entry_id] = pref_dto(peer, pdt, "facts", pref("facts", "map", root, base: bases, seq: step, size: size)
+        .merge("attrs" => { Ancestry::ATTR => link }), peer.now_ms + (1000 * step), entry_id: entry_id, issuer: "#{holder.id}/app")
+    end
+    facts = pdt.map_ref("facts")
+    assert_equal [k, h], facts.heads.map(&:root)
+    facts
   end
 
   # PDT 2 phase 1 (P2-X-09): the Ruby face reads the content-swarm messages it

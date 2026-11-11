@@ -5,7 +5,7 @@ which follows the AgentSpaces core.
 
 ## Unreleased: 0.6.0
 
-The first release, on SPEC v0.1.23 and wire version 3. Not yet on RubyGems.org.
+The first release, on SPEC v0.1.33 and wire version 3. Not yet on RubyGems.org.
 
 ### `agentspaces`
 

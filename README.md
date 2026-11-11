@@ -82,10 +82,10 @@ Either instance can take the order, because both run the same agent.
 ## What it is
 
 - A pure-Ruby wire peer for MRI 3.3 or newer and JRuby 10, checked against the shared golden vectors.
-- The agent DSL, the capability clients, and readers for persistent values and databases on refs.
-- Gems for JRuby, Rails, RubyLLM tools, and MCP.
-- The `agentspaces` command line.
+- The agent DSL, the capability clients, persistent values on refs, and readers for databases on refs.
+- Gems for JRuby, Rails, RubyLLM tools, and MCP, and the `agentspaces` command line.
 - Dials `tcp`, `tls`, `ws`, `wss`, `http`, and `https`, with session attestation.
+- It does not run every feature of the Java core yet. [What Ruby supports](docs/scope.md) lists what it runs today and what is on the Ruby roadmap.
 
 ## Add it to your build
 

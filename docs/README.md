@@ -15,6 +15,6 @@ The README is short by design: what this is, the quick start, and how to add it 
 | [Rails](rails.md) | Ruby developers who build with agentspaces-rb | Put agent classes in `app/agents`, run them with `bin/rails agentspaces:work` (a `Procfile` line). |
 | [JRuby](jruby.md) | Ruby developers who build with agentspaces-rb | fleet = AgentSpaces::JRuby::Fleet.start("agentspaces.yaml") # every starter key binds fleet.bind(Fulfiller.new) # the same class. |
 | [Run it](run-it.md) | Ruby developers who build with agentspaces-rb | Under JRuby, with Maven and a JDK 21 or newer: |
-| [Scope](scope.md) | Ruby developers who build with agentspaces-rb | Built: the wire peer (`tcp`, `tls`, `ws`, `wss`, `http`, `https`, session attestation on the unattested bindings. |
+| [What Ruby supports](scope.md) | Ruby developers who build with agentspaces-rb, and anyone who compares the clients | What the MRI wire peer runs today, and what is on the Ruby roadmap, beside the Python and TypeScript clients and the Java core. |
 | [Releasing](releasing.md) | maintainers who release the gems | The five gems share one version, `AgentSpaces::VERSION` in `gems/agentspaces/lib/agentspaces/version.rb`, which follows the AgentSpaces core. |
 | [Contributing and security](contributing-and-security.md) | contributors | See CONTRIBUTING.md and the code of conduct. |

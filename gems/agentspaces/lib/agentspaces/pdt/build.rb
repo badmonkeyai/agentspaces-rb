@@ -88,7 +88,8 @@ module AgentSpaces
           super()
           @node = PText.leaf_of(value).encode
         rescue NodeFormatError => e
-          raise ArgumentError, "a text value whose t node exceeds the 1 MiB node bound (PD-N-04): #{e.message}"
+          raise ArgumentError, "a text value whose t node exceeds the 1 MiB node bound; " \
+                               "split it into smaller texts: #{e.message}"
         end
 
         def encode(_flusher) = @node
@@ -300,14 +301,14 @@ module AgentSpaces
         return unless Nodes.link_shaped?(key)
 
         raise ArgumentError, "a key must not be a bare link item (CBOR tag 42 over a CID): a link item in a map node " \
-                             "names a spilled node (PD-N-05); hold a CID as text"
+                             "names a spilled node; hold a CID as text"
       end
 
       # Applies PD-N-05 to one encoded value: the item itself, or the node it spills to.
       def spill(item)
         if Nodes.link_shaped?(item)
           raise ArgumentError, "a value must not be a bare link item (CBOR tag 42 over a CID): a link item in a value " \
-                               "slot names a spilled node (PD-N-05); hold a CID as text"
+                               "slot names a spilled node; hold a CID as text"
         end
         return item if item.bytesize <= VALUE_LIMIT
         return TextNode.new(item) if PText.value?(item)
@@ -325,7 +326,8 @@ module AgentSpaces
         end
         if item.bytesize > MAX_X_VALUE
           raise ArgumentError, "a value of #{item.bytesize} CBOR bytes exceeds the #{MAX_X_VALUE} bytes an x node can " \
-                               "hold under the 1 MiB node bound (PD-N-04)"
+                               "hold under the 1 MiB node bound; store a value this large as a byte string, " \
+                               "which becomes a blob, or split it into a map or a vector"
         end
         XNode.new(item)
       end

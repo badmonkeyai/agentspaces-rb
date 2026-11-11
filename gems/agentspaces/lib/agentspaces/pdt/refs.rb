@@ -615,12 +615,18 @@ module AgentSpaces
       # An unchanged value writes nothing. The block runs with no lock held, and
       # the head's base is the heads read before it ran.
       def swap
-        raise ArgumentError, "Ruby reads db refs; the Clojure face writes them (P2-D-04)" if @kind == Refs::KIND_DB
+        if @kind == Refs::KIND_DB
+          raise ArgumentError, "Ruby reads db refs and writes none; write db refs from agentspaces-datascript, " \
+                               "the Clojure DataScript face"
+        end
 
         heads, current = @lock.synchronize do
           read = Refs.heads_among(loadable(live_entries, true))
           linear = read.find { |h| h.mode != Refs::MODE_MULTI }
-          raise ArgumentError, "#{@name} holds a #{linear.mode} head; Ruby writes multi mode only (P2-X-06)" if linear
+          if linear
+            raise ArgumentError, "#{@name} holds a #{linear.mode} head, and Ruby writes multi mode only; " \
+                                 "use mode multi for a ref a Ruby agent writes"
+          end
 
           [read, read.empty? ? empty_value : plain(materialize(read))]
         end
@@ -866,12 +872,16 @@ module AgentSpaces
       #
       # PDT 2 phase 1 (P2-V-02): the walks read a version's bases from its vg
       # node when this reader never saw its entry, the chain nodes it lacks
-      # fetched by NODE_WANT from the heads' issuers and each chain node's
-      # writer, as Java's Refs.commonBase walks them.
+      # fetched by NODE_WANT from the heads' issuers first, then the writer of
+      # every version this reader knows and each chain node's writer, as Java's
+      # Refs.commonBase walks them. A head's writer may lack the node of its
+      # base, which the base's own writer then alone holds (chain walk sources,
+      # srad/agentspaces-pdt2.md 10.20).
       def common_base(heads)
         return Refs::EMPTY_BASE if heads.all? { |h| h.base.empty? }
 
-        reader = ChainReader.new(@pdt.trees, store, heads.map(&:issuer_peer).uniq, @pdt.load_timeout, @chain_misses, @stats)
+        sources = (heads.map(&:issuer_peer) + @known.each_value.map(&:issuer_peer)).uniq
+        reader = ChainReader.new(@pdt.trees, store, sources, @pdt.load_timeout, @chain_misses, @stats)
         walks = heads.map { |h| base_walk(h.root, reader) }
         others = walks[0...-1].map { |w| w[:roots].to_set }
         candidate = walks.last[:roots].find { |r| others.all? { |o| o.include?(r) } }
@@ -925,8 +935,11 @@ module AgentSpaces
       end
 
       # The vg node of a version: read before, or read now through the CID its
-      # head or a child's link names. A CID that names no usable node is
-      # forgotten, so the version reads as one without ancestry.
+      # head or a child's link names. A CID whose bytes are held and name no
+      # usable node is forgotten, so the version reads as one without
+      # ancestry. A node that is late stays the version's vg node, so the next
+      # walk asks again and the next version this writer writes still links it
+      # (chain walk sources, srad/agentspaces-pdt2.md 10.20).
       def chain_node(root, reader)
         node = @chain[root]
         return node unless node.nil?
@@ -936,7 +949,9 @@ module AgentSpaces
 
         reader.prefetch([cid])
         bytes = store.get(cid)
-        node = bytes && Ancestry.node(cid, root, bytes)
+        return nil if bytes.nil?
+
+        node = Ancestry.node(cid, root, bytes)
         if node.nil?
           @ancestry.delete(root)
           return nil
@@ -996,9 +1011,10 @@ module AgentSpaces
 
     # Where a base walk's vg nodes come from (PDT 2 phase 1, P2-V-02), as
     # Java's Refs.ChainReader: the store, then one bare NODE_WANT batch per
-    # call to the heads' issuers and the writer of each node read, bounded by
-    # the load timeout, until the first batch that fails ends the fetching for
-    # the walk, so a walk with no reachable holder costs one timeout at most.
+    # call to the sources common_base names and the writer of each node read,
+    # bounded by the load timeout, until the first batch that fails ends the
+    # fetching for the walk, so a walk with no reachable holder costs one
+    # timeout at most.
     # A node the walk could not get, since a batch did not bring it or the
     # walk met it after the batch that failed, waits out the backoff of
     # Refs.back_off, the rule of a failed head fetch, and a walk during the

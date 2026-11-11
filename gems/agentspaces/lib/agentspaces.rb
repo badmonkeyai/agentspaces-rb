@@ -45,7 +45,7 @@ require_relative "agentspaces/capabilities"
 require_relative "agentspaces/pdt"
 
 # AgentSpaces for Ruby: a wire-compatible peer of the AgentSpaces fleet
-# (SPEC v0.1.23, wire version 3), the Layer 3 verbs over typed entries, and
+# (SPEC v0.1.33, wire version 3), the Layer 3 verbs over typed entries, and
 # an agent DSL whose classes bind to the next def. See README.md.
 module AgentSpaces
   # Forked children drop the connections they inherited (SRAD RB-W-10).

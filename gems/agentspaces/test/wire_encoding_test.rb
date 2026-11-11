@@ -247,7 +247,10 @@ class WireEncodingTest < Minitest::Test
     assert_equal hex("agent_card_ui_cbor"), CBOR.dump(Schema.load("AgentCard", hex("agent_card_ui_cbor")))
     assert_equal "idp", host_card["host"]["signOn"]
     assert_equal %w[example-widgets agentspaces-viz], host_card["ui"]["catalogIds"]
-    assert_equal %w[realm.reads realm.format realm.namespace], app_card["origin"]["attrs"].keys
+    # the realm values of SPEC v0.1.33 (REALM.md §5 revision 4): five attrs keys, the semver, the app link
+    assert_equal %w[realm.reads realm.commit realm.digest realm.format realm.namespace], app_card["origin"]["attrs"].keys
+    assert_equal "1.0.0", app_card["origin"]["version"]
+    assert_equal "app://example-realm/example-app", app_card["url"]
   end
 
   def test_the_kinds_are_closed_and_no_kind_is_tied_to_an_origin

@@ -581,7 +581,8 @@ class Pdt7Test < Minitest::Test
     assert_equal stream.bytesize, heads_of(a, "file").last[1]["size"]
     error = assert_raises(ArgumentError) { writer.map_ref("facts").swap { [1, 2] } }
     assert_includes error.message, "a map ref's value is a Hash"
-    assert_raises(ArgumentError) { writer.db_ref("graph").swap { |db| db } }
+    error = assert_raises(ArgumentError) { writer.db_ref("graph").swap { |db| db } }
+    assert_includes error.message, "Ruby reads db refs and writes none; write db refs from agentspaces-datascript"
   end
 
   def test_a_swap_refuses_a_ref_whose_heads_are_linear
@@ -593,6 +594,7 @@ class Pdt7Test < Minitest::Test
     a.write_entry("pdt", Refs::TYPE, head.merge("mode" => "linear"), tags: Refs.tags(head))
     error = assert_raises(ArgumentError) { writer.map_ref("facts").swap { |m| m.merge("b" => 2) } }
     assert_includes error.message, "linear"
+    assert_includes error.message, "Ruby writes multi mode only; use mode multi for a ref a Ruby agent writes"
   end
 
   def test_texts_merge_by_union_and_a_head_that_holds_a_text_is_version_two

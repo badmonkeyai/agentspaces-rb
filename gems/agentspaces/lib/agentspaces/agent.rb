@@ -83,7 +83,10 @@ module AgentSpaces
   # validates them when the class body evaluates.
   module Agent
     REQUIRED = Object.new.freeze
-    DURATIONS = %i[lease poll_timeout result_lease within].freeze
+    DURATIONS = %i[lease poll_timeout result_lease within settle].freeze
+    # The options a TTL floor check reads as leases or expiries (TtlFloor),
+    # and the verbs that carry one accept ttl_override: "<reason>" beside them.
+    TTL_OPTIONS = %i[lease result_lease within].freeze
     COMMON_RESULT = { result_space: nil, result_lease: "1h", produces: nil }.freeze
     # The action's contract for a planner (SPEC 6.1b), on the verbs whose Java
     # annotation declares it; the card carries it when any term is set.
@@ -94,8 +97,9 @@ module AgentSpaces
     # The accepted options per verb, with defaults; REQUIRED marks the ones a
     # clause must name. Derived from the Java annotations' attributes.
     OPTIONS = {
+      # concurrency: how many take loops serve the method at once, as @SpaceTake(concurrency).
       take: { space: REQUIRED, group: nil, lease: "10m", poll_timeout: "1s", tags: nil, where: nil, description: "",
-              **CONTRACT, **COMMON_RESULT },
+              concurrency: 1, **CONTRACT, **COMMON_RESULT },
       notify: { space: REQUIRED, group: nil, on: WRITTEN, lease: "1h", tags: nil, where: nil, description: "",
                 **COMMON_RESULT },
       bid: { space: REQUIRED, group: nil },
@@ -105,7 +109,10 @@ module AgentSpaces
                  key: nil, key_tag: nil, lease: "1h", where: nil, tags: nil, description: "" },
       join: { space: REQUIRED, group: nil, key: REQUIRED, parts: REQUIRED, within: "1h", mode: "local",
               max_open: 10_000, description: "", **COMMON_RESULT },
-      on_estimate: { epochs: "", ticks: 0, tolerance: 0.0, **COMMON_RESULT },
+      # settle: the rule in time ("PT40S"), as Java's @OnEstimate(settle); ticks: rounds of about a second
+      # (Java's deprecated settleTicks). Neither given: 8 s, Java's default; settle: "0s" (or ticks: 0)
+      # fires on the first estimate. Giving both is refused at bind, as Java refuses it.
+      on_estimate: { epochs: "", ticks: nil, settle: nil, tolerance: 0.0, **COMMON_RESULT },
       ordered_take: { space: REQUIRED, group: nil, lease: "30s", poll_timeout: "2s", tags: nil, where: nil,
                       description: "", **CONTRACT, **COMMON_RESULT },
       # The accumulator lives in the reduce's own space, so no result_space.
@@ -230,6 +237,7 @@ module AgentSpaces
 
       def agentspaces_validate(verb, cue, options, location)
         accepted = OPTIONS.fetch(verb)
+        accepted = accepted.merge(ttl_override: nil) if accepted.keys.intersect?(TTL_OPTIONS)
         unknown = options.keys - accepted.keys
         unless unknown.empty?
           raise DefinitionError.new("#{verb} has no option #{unknown.map(&:inspect).join(', ')}; accepted: " \
@@ -296,6 +304,10 @@ module AgentSpaces
           next if terms.nil? || (terms.is_a?(Array) && terms.size <= CONTRACT_TERMS && terms.all?(String))
 
           raise DefinitionError.new("#{key} #{terms.inspect} is not a list of at most #{CONTRACT_TERMS} texts", location)
+        end
+        if merged.key?(:concurrency) && !(merged[:concurrency].is_a?(Integer) && merged[:concurrency].positive?)
+          raise DefinitionError.new("concurrency is a positive whole number of take loops, got " \
+                                    "#{merged[:concurrency].inspect}", location)
         end
         if merged.key?(:cost) && !(merged[:cost].is_a?(String) && merged[:cost].length <= COST_LENGTH)
           raise DefinitionError.new("cost is a text of at most #{COST_LENGTH} characters, got #{merged[:cost].inspect}",

@@ -49,6 +49,15 @@ module AgentSpaces
     ORIGIN_MAX_ATTRS = 8
     ORIGIN_MAX_ATTR_KEY = 128
     ORIGIN_MAX_ATTR_VALUE = 256
+    # AgentCard threads (SPEC v0.1.38 §6.1): the scopes a reader accepts, the
+    # most threads a card names, and the longest space and key.
+    THREAD_EXACT = "exact"
+    THREAD_TREE = "tree"
+    THREAD_ALL = "all"
+    THREAD_SCOPES = [THREAD_EXACT, THREAD_TREE, THREAD_ALL].freeze
+    AGENT_CARD_MAX_THREADS = 16
+    THREAD_MAX_SPACE = 128
+    THREAD_MAX_KEY = 128
 
     # The fields a stub moves into its parts document, in field order.
     APP_CARD_SPILL_SET = %w[reads actions views ui].freeze
@@ -76,6 +85,8 @@ module AgentSpaces
     CONTROL = /[\u0000-\u001F\u007F]/
     # A control character or a code unit of the Unicode White_Space property, as Java's AppCard tests it.
     WHITESPACE_OR_CONTROL = /[\u0000- \u007F\u0085   -     　]/
+    # A code unit Java's Character.isWhitespace reads as white space.
+    JAVA_WHITESPACE = /[\t\n\v\f\r\u001C-\u001F \u1680\u2000-\u2006\u2008-\u200A\u2028\u2029\u205F\u3000]/
     # Text Java's String.isBlank reads as blank (Character.isWhitespace on every code point).
     JAVA_BLANK = /\A[\t\n\v\f\r\u001C-\u001F   -  -    　]*\z/
 
@@ -290,10 +301,39 @@ module AgentSpaces
       elsif actions && actions.size > AGENT_CARD_MAX_ACTIONS then "a card declares at most #{AGENT_CARD_MAX_ACTIONS} actions"
       elsif actions && actions.map { |a| a["name"] }.uniq.size != actions.size then "action names must be unique within a card"
       elsif card.key?("spill") && (bad = stub_violation(card, AGENT_CARD_SPILL_SET)) then bad
+      elsif (bad = threads_violation(card["threads"])) then bad
       elsif (control = foreign_control(card)) then "a ui control names #{control}, which is not an action of the card"
       else true
       end
     end
+
+    # SPEC v0.1.38: at most 16 threads, all distinct (an empty list is the
+    # absent field, which the schema refuses on the wire).
+    def threads_violation(threads)
+      return nil if threads.nil?
+      return "a card names at most #{AGENT_CARD_MAX_THREADS} threads: #{threads.size}" if threads.size > AGENT_CARD_MAX_THREADS
+      return "a card's threads are distinct" unless threads.uniq.size == threads.size
+
+      nil
+    end
+
+    # ChatThread: a space of 1 to 128 characters with no white space, a scope
+    # of exact, tree, or all, and a key that is empty exactly when the scope
+    # is all and otherwise 1 to 128 characters with no white space.
+    def chat_thread_check(thread)
+      space = thread["space"]
+      key = thread["key"]
+      scope = thread["scope"]
+      if !thread_name?(space, THREAD_MAX_SPACE)
+        "thread.space is 1 to #{THREAD_MAX_SPACE} characters with no white space: #{space}"
+      elsif !THREAD_SCOPES.include?(scope) then "thread.scope is one of #{THREAD_SCOPES}: #{scope}"
+      elsif scope == THREAD_ALL then key.empty? || "thread.key is empty when the scope is all: #{key}"
+      elsif !thread_name?(key, THREAD_MAX_KEY) then "thread.key is 1 to #{THREAD_MAX_KEY} characters with no white space: #{key}"
+      else true
+      end
+    end
+
+    def thread_name?(text, max) = !text.empty? && units(text) <= max && !JAVA_WHITESPACE.match?(text)
 
     def foreign_control(card)
       names = Array(card["actions"]).map { |a| a["name"] }

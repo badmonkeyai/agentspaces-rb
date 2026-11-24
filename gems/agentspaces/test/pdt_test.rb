@@ -1432,18 +1432,20 @@ class PdtTest < Minitest::Test
 
   def test_the_peer_advertises_the_recordless_hint
     peer = peer_at(T0)
-    assert_equal({ "wire.recordless" => "1", "wire.appcard" => "2" }, peer.wire_hints)
+    # wire.horizon rides beside it since the renewal rule of SPEC 7.2 (v0.1.35, RE-L-03).
+    assert_equal({ "wire.recordless" => "1", "wire.appcard" => "2", "wire.horizon" => "1" }, peer.wire_hints)
     sent = []
     peer.define_singleton_method(:send_frame) { |kind, body, to = nil| sent << [kind, body, to] }
     peer.introduce
     assert_equal 1, sent.size
     rumor = load(sent[0][1])
     ad = load(load(rumor["payload"])["adBytes"])
-    assert_equal({ "wire.appcard" => "2", "wire.session" => "1", "wire.recordless" => "1" }, ad["resourceHints"])
+    assert_equal({ "wire.appcard" => "2", "wire.horizon" => "1", "wire.session" => "1", "wire.recordless" => "1" },
+                 ad["resourceHints"])
     peer.channel_auth = :signed
     peer.introduce
     ad = load(load(load(sent[1][1])["payload"])["adBytes"])
-    assert_equal({ "wire.appcard" => "2", "wire.recordless" => "1" }, ad["resourceHints"])
+    assert_equal({ "wire.appcard" => "2", "wire.horizon" => "1", "wire.recordless" => "1" }, ad["resourceHints"])
   end
 
   def test_a_recordless_renew_merges_over_a_held_record_and_waits_for_a_missing_one

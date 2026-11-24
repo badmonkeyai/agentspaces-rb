@@ -19,4 +19,12 @@ nodes.each { |node| node.ordered("payments", members: members) }
 nodes.each { |node| node.bind(Clerk.new) }         # each payment confirmed once, fleet-wide
 ```
 
+A renewal on the JRuby face is the Java node's (SPEC v0.1.35 §7.2), and the MRI peer behaves the same way:
+
+- `renew(extension)` sets the lease to at least `extension` from now. It never shortens it: the new expiry is `max(current, now + extension)`.
+- A renewal that would end sooner succeeds and leaves the lease as it was.
+- Only the issuer renews, and only an entry that is present and unexpired on the renewing node.
+- A take's renewal and a subscription's renewal read "extend" the same way.
+- To end an entry sooner, cancel it. To shorten its lease, cancel it and write it again.
+
 An entry whose schema names a Java class on the class path binds to that class instead of a generated record. Put a build's `target/classes` or its jar on `AGENTSPACES_CLASSPATH` beside the vendored jars; `examples/ruby-fleet/jruby_face_worker.rb` binds the Researcher of example 27 on example 02's own Java records this way.

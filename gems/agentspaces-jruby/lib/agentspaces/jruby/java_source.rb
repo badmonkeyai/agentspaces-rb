@@ -186,7 +186,11 @@ module AgentSpaces
         base = common(options, names, cue)
         case clause.verb
         when :take
-          ["@#{ANNOTATION}.SpaceTake(#{attributes(base.merge(contract(options)))})",
+          # Left to the annotation's default of one loop unless the clause asks for more,
+          # so an agent that never names it compiles to the same interface as before.
+          loops = Integer(options.fetch(:concurrency, 1))
+          take = base.merge(contract(options)).merge("concurrency" => loops == 1 ? nil : loops.to_s)
+          ["@#{ANNOTATION}.SpaceTake(#{attributes(take)})",
            "#{result} #{method}(#{names.fetch(cue)} cue)"]
         when :ordered_take
           ["@#{ANNOTATION}.OrderedTake(#{attributes(base.merge(contract(options)))})",

@@ -26,7 +26,7 @@
   <version>0.6.0</version>
   <packaging>pom</packaging>
   <properties>
-    <agentspaces.version>0.6.0</agentspaces.version>
+    <agentspaces.version>0.7.0-SNAPSHOT</agentspaces.version>
   </properties>
   <dependencies>
     <dependency>

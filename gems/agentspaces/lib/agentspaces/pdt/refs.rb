@@ -207,6 +207,26 @@ module AgentSpaces
       # A both-side decision a reader recorded (PD-R-05).
       PConflict = Struct.new(:name, :key, :winner_root, :loser_root, :reason, keyword_init: true)
 
+      # The live versions a loadable version supersedes, directly or through other live
+      # versions, as Java's Refs.supersededBy; each named by [root, entry id]. heads_among
+      # reads base links only among the versions it is given, so with the middle of a
+      # chain still loading, the version below it would be read as a head and merged in,
+      # and a key a later version removed would come back.
+      def superseded_by(loadable, live)
+        superseded = Set.new
+        frontier = loadable.dup
+        until frontier.empty?
+          newer = frontier.shift
+          by = newer.seq >= MAX_SEQ ? 1 << 62 : newer.seq
+          live.each do |older|
+            next unless older.seq < by && newer.base.include?(older.root)
+
+            frontier << older if superseded.add?([older.root, older.entry_id])
+          end
+        end
+        superseded
+      end
+
       # The entries no other entry supersedes, equal roots folded (10.2).
       def heads_among(entries)
         superseded_below = {}
@@ -301,13 +321,13 @@ module AgentSpaces
 
       # The heads in merge order (PD-R-02); a head whose root cannot load within the timeout is ignored.
       def heads(wait: true)
-        @lock.synchronize { Refs.heads_among(loadable(live_entries, wait)) }
+        @lock.synchronize { current_heads(wait) }
       end
 
       # The ref's value: the single head's, or the merge of 3.6.1; never writes.
       def deref
         @lock.synchronize do
-          hs = Refs.heads_among(loadable(live_entries, true))
+          hs = current_heads(true)
           return empty_value if hs.empty?
 
           materialize(hs)
@@ -327,7 +347,7 @@ module AgentSpaces
         return [] if n <= 0
 
         @lock.synchronize do
-          hs = Refs.heads_among(loadable(live_entries, false))
+          hs = current_heads(false)
           exclude = hs.map(&:root).to_set
           out = []
           seen = Set.new
@@ -526,6 +546,21 @@ module AgentSpaces
       # joins the heads once its root is held, as Java's Refs reads every live
       # head whose root it holds (HLC round six, 2026-11-08 (R3); swarm
       # retries, ROBUSTNESS.md 10.3 E3).
+      # The heads over the loadable live versions. When some live version is still loading,
+      # a loaded version that a loaded head supersedes through it is no head either (Java's
+      # Refs.heads): a late middle version would otherwise bring removed keys back, for a
+      # read and, through swap's merge, for every reader.
+      def current_heads(wait)
+        live = live_entries
+        ready = loadable(live, wait)
+        considered = live.reject { |h| @ignored.include?(h.entry_id) }
+        if ready.size < considered.size
+          folded = Refs.superseded_by(ready, live)
+          ready = ready.reject { |h| folded.include?([h.root, h.entry_id]) } unless folded.empty?
+        end
+        Refs.heads_among(ready)
+      end
+
       def loadable(heads, wait)
         fetches = []
         heads.each do |h|
@@ -621,7 +656,7 @@ module AgentSpaces
         end
 
         heads, current = @lock.synchronize do
-          read = Refs.heads_among(loadable(live_entries, true))
+          read = current_heads(true)
           linear = read.find { |h| h.mode != Refs::MODE_MULTI }
           if linear
             raise ArgumentError, "#{@name} holds a #{linear.mode} head, and Ruby writes multi mode only; " \
@@ -748,8 +783,14 @@ module AgentSpaces
             peer.cancel_entry(@pdt.space, own.entry_id)
             @own.delete(own.entry_id)
           elsif now - own.renewed_at >= @pdt.head_lease_ms / 2
-            peer.renew_entry(@pdt.space, own.entry_id, lease_millis: @pdt.head_lease_ms)
-            own.renewed_at = now
+            begin
+              peer.renew_entry(@pdt.space, own.entry_id, lease_millis: @pdt.head_lease_ms)
+              own.renewed_at = now
+            rescue ArgumentError
+              # SPEC 7.2 (v0.1.35): a head that lapsed or left since the scan is not
+              # renewed, so it is forgotten as a head no longer present is.
+              @own.delete(own.entry_id)
+            end
           end
         end
       end

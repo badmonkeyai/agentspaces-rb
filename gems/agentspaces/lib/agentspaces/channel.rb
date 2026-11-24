@@ -62,7 +62,20 @@ module AgentSpaces
   # One connection that carries whole frames. The stream bindings frame each
   # one with a 4-byte big-endian length (SPEC 9).
   class FrameChannel
+    # The most bytes one piece of a hooked read takes; a read is reported to
+    # on_bytes piece by piece, whatever its size.
+    READ_STEP = 64 * 1024
+
     attr_reader :remote
+
+    # Called from the reader as each piece of a read arrives, the length
+    # prefix's and the body's, whatever the frame's size: bytes of a frame
+    # still arriving show the remote is writing, so a frame on a slow link
+    # is not taken for a dead seed (the dead-seed rule, peer_link.rb; owner
+    # decision 4 of 2026-11-23: bytes count everywhere, not only past
+    # READ_STEP). Local only: nothing on the wire changes. Nil (the
+    # default) reads as before.
+    attr_writer :on_bytes
 
     def initialize(io, remote)
       @io = io
@@ -103,10 +116,34 @@ module AgentSpaces
     private
 
     def read_exact(count)
+      hook = @on_bytes
+      return read_in_pieces(count, hook) if hook
+
       data = @io.read(count)
       raise EOFError, "connection closed" if data.nil? || data.bytesize < count
 
       data.b
+    end
+
+    # count bytes read as they arrive, the hook called after each piece. The
+    # first piece is read straight into the result, so a read that arrives
+    # whole is one read and no copy; the rest come at most READ_STEP at a
+    # time through one reused buffer.
+    def read_in_pieces(count, hook)
+      data = String.new(capacity: count, encoding: Encoding::BINARY)
+      @io.readpartial([count, READ_STEP].min, data)
+      hook.call
+      return data.force_encoding(Encoding::BINARY) if data.bytesize == count
+
+      piece = String.new(capacity: [count - data.bytesize, READ_STEP].min, encoding: Encoding::BINARY)
+      while data.bytesize < count
+        @io.readpartial([count - data.bytesize, READ_STEP].min, piece)
+        data << piece
+        hook.call
+      end
+      data.force_encoding(Encoding::BINARY)
+    rescue EOFError
+      raise EOFError, "connection closed"
     end
   end
 

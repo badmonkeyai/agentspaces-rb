@@ -16,7 +16,7 @@ MCP::Server::Transports::StdioTransport.new(gateway.server).open
 
 ## Keeping the list current
 
-`AgentSpaces::MCP.server(peer)` builds a fixed list from the cards held at that moment. `AgentSpaces::MCP.gateway(peer)` returns a gateway whose `refresh` rebuilds the list and sends `notifications/tools/list_changed` to connected clients when it changed; with `refresh_every:` (seconds) it refreshes on that interval until `close`.
+`AgentSpaces::MCP.server(peer)` builds a fixed list from the cards held at that moment. `AgentSpaces::MCP.gateway(peer)` returns a gateway whose `refresh` rebuilds the list and sends `notifications/tools/list_changed` to connected clients when it changed; with `refresh_every:` (seconds) it refreshes when the peer's advertisement cache changes or a card lapses, and at the latest every `refresh_every` seconds, until `close`.
 
 ## Choosing and guarding actions
 

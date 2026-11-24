@@ -33,6 +33,9 @@ module AgentSpaces
     # ceiling: Java's default ReplicatedSpace settle window, 200 ms (HLC round
     # six, 2026-11-08, R6).
     CONTEST_SETTLE_MILLIS = 200
+    # The longest follow-up wait a take makes after its settle window before it judges the
+    # race: one fold or this much, as the TypeScript TAKE_FOLLOW_UP_MAX_MILLIS.
+    TAKE_FOLLOW_UP_MAX_MILLIS = 300
 
     @live = ObjectSpace::WeakMap.new
     class << self
@@ -85,8 +88,25 @@ module AgentSpaces
     attr_reader :identity, :group, :states, :claims, :members, :reachable, :ads, :pipe_handlers, :revocations,
                 :founding, :frames, :ignored_kinds, :malformed_frames, :reconnects, :seed_peer, :resource_hints,
                 :blocks, :relayed_frames, :relay_signals, :clock, :seeds, :logger, :wire_hints, :pending_states
-    attr_accessor :on_state, :on_claim, :reconnect_interval, :reconnect_window, :peer_ad_interval, :pinned_invite,
+    attr_accessor :on_state, :on_claim, :reconnect_interval, :reconnect_window, :pinned_invite,
                   :refresh_seeds, :delegation
+    # The self-advertisement's refresh interval (seconds); the keepalive rule
+    # of re_lease_period caps it once the group outgrows the probe cycle.
+    attr_reader :peer_ad_interval
+    # The time source (TimeSource::System, or a VirtualTime in tests), the
+    # loop of due work that replaced the 0.25 s ticker and sweep, and the
+    # watchdog that judges that loop and the reader from outside.
+    attr_reader :time, :node_loop, :watchdog
+    # Wall steps seen (a change of more than 1 s in wall minus monotonic
+    # between two loop turns), and the resumes they or a late wake started.
+    attr_reader :wall_steps, :resumes, :reader_restarts
+
+    # Deprecated: resumes's old name, kept for one release.
+    def resume_rejoins = @resumes
+
+    # The TTL floor check (TtlFloor) this peer's configuration and binders
+    # report to: lenient by default; AgentSpaces.start reads agentspaces.ttl.
+    attr_accessor :ttl_floor
     # :session (the default and dev-local's): advertise wire.session=1 and,
     # on a connection the transport cannot attest, run session attestation
     # with a member that advertises it too; :signed: sign every frame.
@@ -105,9 +125,18 @@ module AgentSpaces
     # appcard_level: the AppCard level advertised under wire.appcard (1 or 2).
     # ad_cache_max_entries, ad_cache_max_bytes: the cache's bounds.
     # spill_max_fetch_bytes: the largest parts document resolve fetches.
+    # horizon: :per_entry (the default) advertises wire.horizon=1 and applies
+    # the per-entry horizon of SPEC 7.3 while the view allows it; :legacy
+    # keeps the legacy horizon and advertises nothing (peer_replication.rb).
+    # time: a time source (TimeSource; VirtualTime in tests) for wall time and
+    # the monotonic base of local periods; a peer on virtual time starts no
+    # loop thread, and its test runs the due work (run_due, advance).
+    # watchdog: the Watchdog that judges the loop and the reader (the
+    # process's own on real time, a manual one on virtual time).
     def initialize(identity, group, clock: nil, founder: nil, dialers: nil, logger: nil, appcard_level: APPCARD_LEVEL,
                    ad_cache_max_entries: AD_CACHE_MAX_ENTRIES, ad_cache_max_bytes: AD_CACHE_MAX_BYTES,
-                   spill_max_fetch_bytes: Cards::CARD_SPILL_MAX_FETCH_BYTES)
+                   spill_max_fetch_bytes: Cards::CARD_SPILL_MAX_FETCH_BYTES, horizon: Horizon::PER_ENTRY,
+                   time: nil, watchdog: nil)
       unless [1, APPCARD_LEVEL].include?(appcard_level) && appcard_level.is_a?(Integer)
         raise ArgumentError, "this build reads AppCard levels 1 to #{APPCARD_LEVEL}: #{appcard_level.inspect}"
       end
@@ -117,7 +146,8 @@ module AgentSpaces
       @spill_max_fetch_bytes = positive!(spill_max_fetch_bytes, "spill_max_fetch_bytes")
       @identity = identity
       @group = group
-      @clock = clock || -> { Time.now.to_f }
+      @time = TimeSource.of(time: time, clock: clock)
+      @clock = clock || (time.nil? ? -> { Time.now.to_f } : -> { time.wall_ms / 1000.0 })
       @configured_founder = founder
       @dialers = (dialers || [TcpDialer.new, TlsDialer.new, WsDialer.new, HttpDialer.new]).to_h { |d| [d, d.schemes] }
       @logger = logger
@@ -128,6 +158,7 @@ module AgentSpaces
       @members = {}
       @reachable = Set.new
       @ads = {}
+      @ads_version = 0
       @ad_bytes = 0
       @ads_refused_cache_full = 0
       @app_cards_downgraded = 0
@@ -174,11 +205,10 @@ module AgentSpaces
       @block_asked = {}
       @reconnect_interval = 5.0
       @reconnect_window = 600.0
-      # When the current link was dialed, and how many links in a row ended
-      # within the reconnect interval: such a link counts as a failed round of
-      # dials (swarm retries, ROBUSTNESS.md 10.6).
+      # When the current link was dialed: a link that ends within the
+      # reconnect interval counts as a failed round of dials (swarm retries,
+      # ROBUSTNESS.md 10.6).
       @link_since = 0.0
-      @quick_drops = 0
       @peer_ad_interval = 30.0
       @reconnects = 0
       @fold_lock = Mutex.new
@@ -186,6 +216,7 @@ module AgentSpaces
       @fold_count = 0
       @last_pull = {}
       @state_lock = Monitor.new
+      @ads_changed = @state_lock.new_cond
       @pid = Process.pid
       @inherited = false
       @threads = []
@@ -195,6 +226,12 @@ module AgentSpaces
       @session = nil
       @session_frames_sent = 0
       @session_peers = Set.new
+      @ttl_floor = TtlFloor.lenient(logger: logger)
+      init_replication(horizon)
+      init_settle
+      init_loop(watchdog)
+      init_link
+      init_answers
       Peer.live[object_id] = self
     end
 
@@ -210,23 +247,27 @@ module AgentSpaces
       self
     end
 
-    # Dials the seeds in order until one accepts, and remembers them all: a
-    # lost socket fails over to the next seed inside the reconnect window. A
-    # hostname expands to every address, each its own seed. Returns the seed
-    # connected to; raises NoSeedError naming every seed and its failure.
+    # Dials the seeds in list order, 250 ms apart (or at once after a
+    # refusal), the first to accept winning (owner decision 2026-11-23: a
+    # dead first seed delays the join by 250 ms, not a connect timeout), and
+    # remembers them all: a lost socket fails over to the next seed inside
+    # the reconnect window. A hostname expands to every address, each its
+    # own seed. Returns the seed connected to; raises NoSeedError naming
+    # every seed and its failure.
     def connect_any(seeds)
       expanded = expand_seeds(seeds)
       raise NoSeedError, "no seeds to dial" if expanded.empty?
 
+      check_fork!
       @seeds = expanded
-      failures = []
-      expanded.each do |seed|
-        connect(seed)
-        return seed
-      rescue SystemCallError, IOError, SocketError, OpenSSL::SSL::SSLError => e
-        failures << "#{seed}: #{e.class.name.split('::').last} #{e.message}"
-      end
-      raise NoSeedError, "no seed accepted a connection: #{failures.join('; ')}"
+      seed, channel, failures = dial_first(expanded)
+      raise NoSeedError, "no seed accepted a connection: #{failures.join('; ')}" if channel.nil?
+
+      adopt_channel(seed, channel)
+      introduce
+      announce_channel
+      pull_revocations
+      seed
     end
 
     # Joins a self-certifying group knowing only its GroupID and a seed
@@ -279,6 +320,8 @@ module AgentSpaces
     def close
       @running = false
       @closed = true
+      redial_now! # a reconnect pausing between rounds sees the close at once
+      stop_loop
       channel = @channel
       @channel = nil
       channel&.close
@@ -315,13 +358,34 @@ module AgentSpaces
     # ------------------------------------------------------------- protocol
 
     # Publishes this peer's leased self-advertisement (SPEC 5.2).
+    # A changed advertisement is issued after the last one (§10.16 of the
+    # event-loop record): a receiver keeps the card it holds on an equal
+    # instant, so a change issued in the second of the last introduction
+    # (the relay.via hint learned just after the dial) takes the next
+    # millisecond, and each introduction's gossip item id is new.
     def introduce
       now = now_ms
       hints = @resource_hints.merge(@wire_hints)
       hints = hints.merge(Session::HINT => "1") if @channel_auth == :session
-      ad = Wire.peer_advertisement(@group, @identity, Instants.iso(now - (now % 1000)), "PT10M", hints)
-      send_frame("RUMOR", Wire.rumor_body("peers", "peer:#{@identity.peer_id}:#{now}", Wire::HOPS,
+      issued = issue_ms("peer:#{@identity.peer_id}", [hints.sort, SELF_AD_TTL].hash, now - (now % 1000))
+      item = @state_lock.synchronize { @last_peer_item = [now, @last_peer_item.to_i + 1].max }
+      ad = Wire.peer_advertisement(@group, @identity, Instants.iso(issued), SELF_AD_TTL, hints)
+      @introduced_at = @time.mono
+      send_frame("RUMOR", Wire.rumor_body("peers", "peer:#{@identity.peer_id}:#{item}", Wire::HOPS,
                                           Wire.signed_peer_ad(ad, @identity)))
+    end
+
+    # The self-advertisement's TTL.
+    SELF_AD_TTL = "PT10M"
+
+    def peer_ad_interval=(seconds)
+      seconds = Float(seconds)
+      raise ArgumentError, "the advertisement interval is positive: #{seconds}" unless seconds.positive?
+
+      @ttl_floor&.check_cycle("agentspaces.peer-ad-interval-millis", Instants.parse_duration_millis(SELF_AD_TTL),
+                              (seconds * 1000).round)
+      @peer_ad_interval = seconds
+      @node_loop&.wake(:self_ad)
     end
 
     # Writes one signed entry into a replicated space; returns its id. With
@@ -341,6 +405,7 @@ module AgentSpaces
       end
       entry_id, body = Wire.entry_delta(space, @group, type_name, payload, @identity, agent_name, lease_millis,
                                         agent: agent, now_ms: now_ms, tags: tags, payload_ref: payload_ref)
+      observe_lease(Derive.space_id_local("#{@group}/#{space}"), lease_millis)
       send_frame("RUMOR", body)
       # The writer holds its own entry too, so a local read sees it at once.
       delta = CBOR.load(CBOR.load(body)["payload"])
@@ -353,6 +418,7 @@ module AgentSpaces
     # (issue_card).
     def publish_ad(ad_type, ad)
       ad = issue_card(ad_type, ad) if CARD_TYPES.include?(ad_type)
+      ad = after_last_issue(ad)
       stored = Wire.stored_ad(ad_type, ad, @identity)
       accept_ad(stored)
       item_id = "#{ad['id']}:#{Instants.parse_millis(ad['issued'])}"
@@ -361,8 +427,13 @@ module AgentSpaces
 
     # Anti-entropy pull (SPEC 5.3): an empty digest; the partner answers with
     # every state this replica lacks. The revocation streams ride along.
+    # Toward a partner whose card carries wire.ae=2 the pull is budgeted and
+    # continues while the answer leaves states out (SPEC annex I.6,
+    # RE-L-03; peer_replication.rb).
     def pull_space(space)
       @pulled_spaces << space
+      return pull_space_budgeted(space) if budgeted_partner?
+
       digests = { "space:#{space}" => "".b }
       Revocation::STREAMS.each { |s| digests[s] = "".b }
       send_frame("DIGEST", Wire.digest_body(digests))
@@ -378,8 +449,30 @@ module AgentSpaces
       true
     end
 
+    # The membership view rides along (SPEC 5.2, v0.1.17; v0.1.21: the
+    # "view" stream is pulled by a joining client): a late joiner behind a
+    # seed learns the members whose introductions it never saw from the same
+    # answer. A dial-only member refreshes its card to its seed alone,
+    # unforwarded, so without this pull a member that joined later never
+    # held it.
     def pull_revocations
-      send_frame("DIGEST", Wire.digest_body(Revocation::STREAMS.to_h { |s| [s, "".b] }))
+      send_frame("DIGEST", Wire.digest_body(Revocation::STREAMS.to_h { |s| [s, "".b] }.merge("view" => view_digest)))
+    end
+
+    # PeerNode.ViewState.digest: one line per member whose card is held and
+    # live, this peer included, sorted. A lapsed card is left out, so the
+    # seed sends the member's current card if it holds one: after a wake a
+    # member whose card lapsed only while this peer slept comes back (owner
+    # decision 3 of 2026-11-23), rather than staying out for good.
+    def view_digest
+      now = now_ms
+      ids = @state_lock.synchronize do
+        @members.select do |id, ad|
+          card = @member_cards[id]
+          ad.is_a?(Hash) && ad["issuer"] && !card.nil? && card[0] > now
+        end.keys
+      end
+      (ids | [@identity.peer_id]).sort.map { |id| "#{id}\n" }.join.b
     end
 
     def pull_ads
@@ -432,6 +525,33 @@ module AgentSpaces
     end
 
     def ads_refused_cache_full = @state_lock.synchronize { @ads_refused_cache_full }
+
+    # A counter of the advertisement cache's admissions, for a waiter that
+    # follows the cache (an MCP gateway's tool list).
+    def ads_version = @state_lock.synchronize { @ads_version }
+
+    # Blocks until the cache admitted something since the version since, or
+    # seconds pass; returns whether it changed.
+    def await_ads_change(since, seconds)
+      deadline = monotonic + [seconds.to_f, 0.0].max
+      @state_lock.synchronize do
+        while @ads_version == since
+          remaining = deadline - monotonic
+          return false if remaining <= 0 || @closed
+
+          @ads_changed.wait(remaining)
+        end
+        true
+      end
+    end
+
+    # The earliest expiry (epoch ms) among the live AgentCards held, or nil.
+    def next_card_expiry_ms
+      now = now_ms
+      @state_lock.synchronize do
+        @ads.values.filter_map { |e| e["expires"] if e["type"] == "AgentCard" && e["expires"] > now }.min
+      end
+    end
 
     # The sum of the encodings the advertisement cache holds.
     def ad_cache_bytes = @state_lock.synchronize { @ad_bytes }
@@ -584,6 +704,7 @@ module AgentSpaces
       return count_undecodable unless decodes?("SpaceWire.EntryStateDto", dto)
 
       merge_state(dto)
+      stale_offered(dto)
     end
 
     # Folds one signed claim after validating its bindings, bounds, proof,
@@ -633,7 +754,11 @@ module AgentSpaces
       # as Java's mergeClaim defers it only when it finds no violation.
       return defer_offer(claim_offer_key(entry_id, claim)) if lead == :deferred
 
+      held = @claims[entry_id]
       winner = @state_lock.synchronize { @claims[entry_id] = Wire.merge_claims(@claims[entry_id], signed) }
+      observe_lease(claim["spaceId"], expires - stamped)
+      note_change unless winner == held
+      settle_after_claim(entry_id, signed, held, winner)
       @on_claim&.call(entry_id, winner)
       notify_observers { |o| o.claim_folded(entry_id, winner) }
       wake_fold_waiters
@@ -651,6 +776,13 @@ module AgentSpaces
     # it: uncompleted, with an add dot no remove covers. A cancel's removes
     # cover the adds, so a withdrawn entry is absent from reads and takes at
     # once (core cancel events, 2026-11-09).
+    # How long after its claim goes out a take may be judged in a quiet space: the
+    # whole settle window, then the follow-up wait. A take lease must be longer.
+    def self.take_judged_within_millis(settle_millis)
+      settle = [Integer(settle_millis), 0].max
+      settle + [settle, TAKE_FOLLOW_UP_MAX_MILLIS].min
+    end
+
     def self.present?(dto)
       return false if dto["completed"]
 
@@ -669,10 +801,18 @@ module AgentSpaces
 
       record = dto["record"]
       entry_id = record["entryId"]
-      return unless entry_id && dots_bound_to_issuer?(dto, record) && verify_state(dto, record)
+      return unless entry_id && dots_bound_to_issuer?(dto, record)
+      unless verify_state(dto, record)
+        # A completion that does not authenticate under the held claim may be
+        # a displaced holder's (SPEC 7.4, pairing the evidence; peer_settle.rb).
+        remember_unproven(dto, record) if dto["completed"]
+        return
+      end
 
       if refused_for_revocation?(dto, record)
         @state_lock.synchronize { @pending_states.delete(entry_id) }
+        # A replica that sends space digests acknowledges what it refused (SPEC 6.1, 7.3).
+        acknowledge(record["spaceId"], TextDigest.state_line(entry_id, dto))
         return
       end
       # HLC logical counter, 2026-11-08 (Rust team report): the peer drops a
@@ -688,6 +828,8 @@ module AgentSpaces
       when :deferred then return defer_offer(state_offer_key(dto, record))
       when :hostile then return refuse_state(dto, record, :far_future)
       end
+      # SPEC 7.3 (v0.1.35): a state past its collection horizon never comes back.
+      return if refused_at_door?(dto, record)
 
       pending = @state_lock.synchronize { @pending_states.delete(entry_id) }
       # The read and the write share one critical section, so a completion that lands meanwhile
@@ -695,8 +837,11 @@ module AgentSpaces
       previous = nil
       merged = @state_lock.synchronize do
         previous = @states[entry_id]
+        record_signed_state(entry_id, dto) # what a DIGEST answer forwards (peer_answer.rb)
         @states[entry_id] = previous.nil? ? dto : join(previous, dto)
       end
+      note_change unless merged == previous
+      collect_hint(merged) unless merged == previous
       @on_state&.call(merged)
       notify_observers { |o| o.state_folded(merged) }
       # Core cancel events, 2026-11-09: a cancel that withdraws an entry present here is
@@ -773,13 +918,31 @@ module AgentSpaces
     # wait one settle window, and win when the lattice still says so. Returns
     # the entry id, or nil when out-arbitrated or nothing matched. matches is
     # a callable over (payload Hash, tags Hash); bid a Float or a callable.
+    #
+    # Only a live claim wins (SPEC 7.4), and in a quiet space the claim is
+    # judged after the whole settle window and a follow-up wait of up to
+    # min(settle, 300 ms), so lease_millis must exceed
+    # Peer.take_judged_within_millis(settle) (900 ms for the default 0.6 s
+    # window); a take whose lease cannot outlast that raises ArgumentError at
+    # once, as Java and TypeScript refuse it. Leave a margin above the bound.
     def take_entry(space, type_name, agent_name: "ruby", lease_millis: 60_000, settle_seconds: 0.6,
                    timeout_seconds: 15.0, agent: nil, matches: nil, bid: 0.0)
       check_fork!
+      # A lease no longer than the window and the follow-up wait has always lapsed when the
+      # take judges it, so such a take could only publish doomed claims, each holding the entry
+      # from other takers for its lease, and come back empty at its timeout (2026-11-15).
+      settle_millis = (settle_seconds * 1000).round
+      judged_within = Peer.take_judged_within_millis(settle_millis)
+      unless Integer(lease_millis) > judged_within
+        raise ArgumentError, "a take lease of #{lease_millis} ms cannot outlast its settle window of " \
+                             "#{settle_millis} ms and follow-up wait: the claim would lapse before the take " \
+                             "is judged (the lease must exceed #{judged_within} ms)"
+      end
       holder = agent.nil? ? @identity.agent(agent_name) : agent.agent_id
       return nil if @revocations.refuses?(holder, agent&.public_raw, nil)
 
-      space_id = Derive.space_id_local("#{@group}/#{space}")
+      space_id = space_id_of(space)
+      observe_lease(space_id, lease_millis)
       deadline = monotonic + timeout_seconds
       while monotonic < deadline && @running
         pull_space_paced(space, settle_seconds)
@@ -816,12 +979,28 @@ module AgentSpaces
           claimed = true
           sleep(settle_seconds)
           pull_space_paced(space, settle_seconds)
-          await_fold([settle_seconds, 0.3].min)
+          await_fold([settle_seconds, TAKE_FOLLOW_UP_MAX_MILLIS / 1000.0].min)
           winner = claim_of(entry_id)
           # core cancel events, 2026-11-09: an entry completed or withdrawn during the settle
-          # window is nobody's, so a cancel that folded meanwhile leaves the take empty
+          # window is nobody's, so a cancel that folded meanwhile leaves the take empty. Only a
+          # claim still live wins (SPEC 7.4), as Java and TypeScript judge it: a claim that
+          # lapsed during a late wake is free for any taker already.
           if winner && winner["holder"] == holder && Integer(winner["epoch"]) == epoch &&
+             winner.fetch("expiresAtMillis", 0).to_i > now_ms &&
              Peer.present?(@states[entry_id] || {})
+            # Rule two of the settle guarantee (SPEC 7.4): the holder this
+            # claim displaced completed the entry during the window, so the
+            # work is done; this take acknowledges that completion under its
+            # own claim, writing no result, and comes back empty.
+            if acknowledging?(entry_id, holder, epoch)
+              begin
+                complete_entry(space, entry_id, agent: agent, holder: holder, epoch: epoch)
+              rescue ArgumentError
+                nil # acknowledged (complete_entry says so by raising), or the claim lapsed meanwhile
+              end
+              return nil
+            end
+            @state_lock.synchronize { @outbid_completions.delete(entry_id) }
             return entry_id
           end
         end
@@ -830,23 +1009,77 @@ module AgentSpaces
       nil
     end
 
-    # Completes a held entry: its state with the monotone completed flag set,
-    # re-signed by the holder and carrying the winning claim. An entry this
-    # replica holds completed or withdrawn is held by nobody, as Java's
-    # complete refuses it (core cancel events, 2026-11-09).
-    def complete_entry(space, entry_id, agent: nil)
-      check_fork!
-      dto = @states.fetch(entry_id).dup
-      raise ArgumentError, "#{entry_id} is not held here: it is completed or withdrawn" unless Peer.present?(dto)
-
-      dto["completed"] = true
-      dto = Wire.sign_state(dto, @identity, agent, now_ms)
-      @state_lock.synchronize { @states[entry_id] = dto }
-      proof = @claims[entry_id]
-      send_frame("RUMOR", Wire.rumor_body("space:#{space}", "d:#{entry_id}", Wire::HOPS,
-                                          CBOR.dump({ "state" => dto, "claimEntry" => proof ? entry_id : nil,
-                                                      "claim" => proof })))
+    # Raises ArgumentError unless this replica's live claim on the entry is still
+    # the taker's: holder and epoch when given (the take's own claim), else the
+    # agent's, else one of this peer's agents. SPEC 7.4, the settle guarantee
+    # (2026-11-15): a claim can reach a taker later than its settle window, so a
+    # take that won its window can be displaced by an earlier claim before it
+    # completes, and a holder that learns of a better claim MUST NOT complete.
+    # Java's complete and the TypeScript requireHeld refuse the same.
+    def require_held(entry_id, agent: nil, holder: nil, epoch: nil)
+      claim = claim_of(entry_id)
+      expected = holder || agent&.agent_id
+      held = !claim.nil? && Integer(claim["expiresAtMillis"] || 0) > now_ms
+      held &&= expected.nil? ? claim["holder"].to_s.start_with?("#{@identity.peer_id}/") : claim["holder"] == expected
+      held &&= Integer(claim["epoch"]) == epoch unless epoch.nil?
+      raise ArgumentError, "#{entry_id} is not held here: the take lapsed, or a better claim displaced it" unless held
     end
+
+    # Completes a held entry: its state with the monotone completed flag set,
+    # re-signed by the holder and carrying the winning claim. When the holder
+    # its claim displaced already completed the entry (rule two of SPEC 7.4,
+    # peer_settle.rb), the completion is that one's acknowledgement: it goes
+    # out, and ArgumentError says no result is to be written. An entry this
+    # replica holds completed or withdrawn is held by nobody, as Java's
+    # complete refuses it (core cancel events, 2026-11-09), and so is one whose
+    # claim lapsed or lost to a better claim that arrived after the settle
+    # window (require_held; holder and epoch name the take's own claim).
+    def complete_entry(space, entry_id, agent: nil, holder: nil, epoch: nil)
+      check_fork!
+      loop do
+        previous = @state_lock.synchronize { @states.fetch(entry_id) }
+        raise ArgumentError, "#{entry_id} is not held here: it is completed or withdrawn" unless Peer.present?(previous)
+
+        require_held(entry_id, agent: agent, holder: holder, epoch: epoch)
+
+        acknowledgement = acknowledging?(entry_id, holder || agent&.agent_id, epoch)
+        dto = Wire.sign_state(previous.merge("completed" => true), @identity, agent, now_ms)
+        # Written back only over the state it was read from (store_over): a cancel or a renewal
+        # that folded while this signed would be lost here, so the loop judges afresh instead.
+        next unless store_over(entry_id, previous, dto)
+
+        proof = @claims[entry_id]
+        note_completed(entry_id, proof && Integer(proof["claim"]["epoch"]), space, acknowledgement)
+        sent = send_frame("RUMOR", Wire.rumor_body("space:#{space}", "d:#{entry_id}", Wire::HOPS,
+                                                   CBOR.dump({ "state" => dto, "claimEntry" => proof ? entry_id : nil,
+                                                               "claim" => proof })))
+        if acknowledgement
+          raise ArgumentError, "#{entry_id} was completed by the holder this take displaced (SPEC 7.4, rule two): " \
+                               "this take acknowledged that completion and writes no result"
+        end
+        return sent
+      end
+    end
+
+    # Writes dto as the entry's state only while the state is still the one the
+    # caller read (compare and set, under the state lock), and says whether it
+    # did. A renewal or a completion reads the entry, signs outside the lock,
+    # and writes back; a fold from the reader thread, or a cancel from another
+    # caller, can land in between, and a plain write would put the old copy back
+    # over it. A renewal written over a withdrawal makes the entry live again,
+    # with a lease past the withdrawal's own, which the per-entry horizon of
+    # SPEC 7.3 rules out (the adversarial review of replication by entry,
+    # 2026-11-15). Java's ReplicatedSpace does both under its lock.
+    def store_over(entry_id, previous, dto)
+      @state_lock.synchronize do
+        next false unless @states[entry_id].equal?(previous)
+
+        @states[entry_id] = dto
+        record_signed_state(entry_id, dto)
+        true
+      end
+    end
+    private :store_over
 
     # Cancels an entry this peer (or agent) wrote, as Java's EntryHandle.cancel
     # does (PDT 2 phase 7, P2-X-06): a state whose removes cover its adds,
@@ -876,42 +1109,99 @@ module AgentSpaces
                                           CBOR.dump({ "state" => dto, "claimEntry" => nil, "claim" => nil })))
     end
 
-    # Renews this peer's write of an entry (SPEC 7.3); only the issuer renews.
+    # Renews this peer's write of an entry by the rule of SPEC 7.2 (v0.1.35,
+    # normative): the lease runs to at least lease_millis from now and never
+    # shortens, max(current expiry, now + lease_millis). Three conditions
+    # guard it, and a renewal that fails one raises ArgumentError, changes
+    # nothing and sends nothing: only the issuer renews; the entry is present
+    # here, neither completed nor withdrawn; and its lease has not lapsed here.
+    # A renewal that leaves the lease as it was succeeds and sends nothing. A
+    # caller that wants a shorter lease cancels and writes again. Returns the
+    # expiry in epoch milliseconds. The rule is what the hint wire.horizon=1
+    # promises, so the per-entry horizon of SPEC 7.3 can rely on it.
     def renew_entry(space, entry_id, lease_millis: 600_000, agent: nil)
       check_fork!
-      dto = @states.fetch(entry_id).dup
-      issuer = (dto["record"] || {})["issuer"].to_s
-      if agent && agent.agent_id != issuer
-        raise ArgumentError, "#{entry_id} was written by #{issuer}, not #{agent.agent_id}"
-      end
-      if agent.nil? && !issuer.start_with?("#{@identity.peer_id}/")
-        raise ArgumentError, "#{entry_id} was written by #{issuer}, not by this peer"
-      end
+      extension = Integer(lease_millis)
+      raise ArgumentError, "a renewal extends by zero or more milliseconds: #{lease_millis}" if extension.negative?
 
-      now = now_ms
-      dto["leaseStamp"] = Wire.hlc_now(issuer, now)
-      dto["leaseValue"] = { "holder" => issuer, "expiresAtMillis" => now + lease_millis, "kind" => "WRITE" }
-      dto = Wire.sign_state(dto, @identity, agent, now)
-      @state_lock.synchronize { @states[entry_id] = dto }
-      send_frame("RUMOR", Wire.rumor_body("space:#{space}", "r:#{entry_id}:#{now}", Wire::HOPS,
-                                          CBOR.dump({ "state" => dto, "claimEntry" => nil, "claim" => nil })))
+      loop do
+        previous = @state_lock.synchronize { @states.fetch(entry_id) }
+        issuer = (previous["record"] || {})["issuer"].to_s
+        if agent && agent.agent_id != issuer
+          raise ArgumentError, "#{entry_id} was written by #{issuer}, not #{agent.agent_id}"
+        end
+        if agent.nil? && !issuer.start_with?("#{@identity.peer_id}/")
+          raise ArgumentError, "#{entry_id} was written by #{issuer}, not by this peer"
+        end
+        unless Peer.present?(previous)
+          raise ArgumentError, "#{entry_id} is completed or withdrawn here, so it is not renewed"
+        end
+
+        now = now_ms
+        current = Horizon.expiry_of(previous)
+        raise ArgumentError, "#{entry_id}'s lease lapsed here, so it is not renewed" if current <= now
+
+        expiry = Horizon.renewed_expiry(current, now, extension)
+        if expiry == current
+          note_renewal_kept(space, entry_id, "write", current, now + extension)
+          return current
+        end
+
+        dto = previous.merge("leaseStamp" => Wire.hlc_now(issuer, now),
+                             "leaseValue" => { "holder" => issuer, "expiresAtMillis" => expiry, "kind" => "WRITE" })
+        dto = Wire.sign_state(dto, @identity, agent, now)
+        # A cancel, a completion or another renewal that landed while this signed is judged
+        # afresh by the next pass, never overwritten (store_over).
+        next unless store_over(entry_id, previous, dto)
+
+        observe_lease(dto.dig("record", "spaceId"), expiry - Wire.hlc_physical(dto["leaseStamp"]))
+        send_frame("RUMOR", Wire.rumor_body("space:#{space}", "r:#{entry_id}:#{now}", Wire::HOPS,
+                                            CBOR.dump({ "state" => dto, "claimEntry" => nil, "claim" => nil })))
+        return expiry
+      end
     end
 
     # Renews this peer's take of an entry: the held claim re-signed with the
     # same epoch, stamp, holder, and bid and a later expiry, which the claim
     # lattice prefers (expiry descending), as Java renews a TakenEntry. A
     # renewal keeps the claim's stamp, so certificates judge it at that stamp.
-    def renew_claim(space, entry_id, lease_millis:, agent: nil)
+    # It reads "extend" as a write renewal does (SPEC 7.2, v0.1.35): the hold
+    # runs to at least lease_millis from now and never shortens, a renewal
+    # that leaves it as it was sends nothing, and a hold that already lapsed
+    # here raises ArgumentError. Returns the expiry in epoch milliseconds.
+    def renew_claim(space, entry_id, lease_millis:, agent: nil, holder: nil, epoch: nil)
       check_fork!
+      extension = Integer(lease_millis)
+      raise ArgumentError, "a renewal extends by zero or more milliseconds: #{lease_millis}" if extension.negative?
+
       signed = @claims[entry_id]
-      holder = agent.nil? ? nil : agent.agent_id
+      holder ||= agent&.agent_id
       claim = signed && signed["claim"]
       if claim.nil? || (holder ? claim["holder"] != holder : !claim["holder"].to_s.start_with?("#{@identity.peer_id}/"))
         raise ArgumentError, "#{entry_id} is not held by #{holder || @identity.peer_id}"
       end
+      # holder and epoch name the take's own claim (Taken#renew), as Python's renew_take checks them:
+      # a later take of the entry by the same holder is that take's to renew, not this one's.
+      raise ArgumentError, "#{entry_id} is not held at epoch #{epoch}" if epoch && Integer(claim["epoch"]) != epoch
       raise ArgumentError, "#{entry_id} is completed" if (@states[entry_id] || {})["completed"]
+      # A revoked holder's take is not renewed: its renewal would be refused
+      # by every replica anyway, and the hold is to lapse (item 11 of
+      # DRIFT-FROM-PHASE6, as the core's TakeContext.renew ends).
+      if @revocations.refuses?(claim["holder"], agent&.public_raw, nil)
+        raise ArgumentError, "the take of #{entry_id} is not renewed: #{claim['holder']} is revoked"
+      end
 
-      renewed = claim.merge("expiresAtMillis" => now_ms + Integer(lease_millis))
+      now = now_ms
+      current = Integer(claim["expiresAtMillis"])
+      raise ArgumentError, "the take of #{entry_id} lapsed here, so it is not renewed" if current <= now
+
+      expiry = Horizon.renewed_expiry(current, now, extension)
+      if expiry == current
+        note_renewal_kept(space, entry_id, "take", current, now + extension)
+        return current
+      end
+
+      renewed = claim.merge("expiresAtMillis" => expiry)
       proof = Wire.signed_claim(renewed, @identity, agent)
       @state_lock.synchronize { @claims[entry_id] = Wire.merge_claims(@claims[entry_id], proof) }
       send_frame("RUMOR", Wire.rumor_body("space:#{space}", "c:#{entry_id}:#{renewed['stamp']}:#{now_ms}", Wire::HOPS,
@@ -921,6 +1211,7 @@ module AgentSpaces
 
     # A Space of this peer's group by name (see AgentSpaces::Space).
     def space(name, agent: nil, agent_name: "ruby")
+      space_id_of(name) # remembered by id, for the targeted rounds toward displaced holders
       Space.new(self, name, agent: agent, agent_name: agent_name)
     end
 
@@ -929,13 +1220,13 @@ module AgentSpaces
       Binder.new(self, agent: agent, **options).bind(agent_object)
     end
 
-    # Registers a Space for fold events; the first one starts the sweep that
-    # judges lease expiry by the clock (EXPIRED, REAPPEARED, lapsed watches).
+    # Registers a Space for fold events; the loop's sweep duty judges lease
+    # expiry by the clock for it (EXPIRED, REAPPEARED, lapsed watches) at the
+    # earliest lapse its watches wait on.
     def add_observer(observer)
-      @state_lock.synchronize do
-        @observers << observer
-        start_thread("agentspaces-sweep") { sweep_loop } if @observers.size == 1
-      end
+      @state_lock.synchronize { @observers << observer }
+      start_loop
+      @node_loop.wake(:sweep)
     end
 
     def remove_observer(observer) = @state_lock.synchronize { @observers.delete(observer) }
@@ -953,6 +1244,7 @@ module AgentSpaces
       sender = env["from"]
       if sender.is_a?(String) && sender != @identity.peer_id
         @members[sender] ||= {}
+        heard_from(sender)
         @reachable << sender unless relayed
         if !relayed && @seed && env["to"] == @identity.peer_id && @seed_peer != sender
           # Over our one connection an addressed frame is the seed's own; it is
@@ -966,6 +1258,10 @@ module AgentSpaces
       case kind
       when "SESSION_HELLO" then on_session_hello(env)
       when "PING" then send_frame("ACK", Wire.ack_body(Wire.decode_body(kind, body)["nonce"]))
+      # An ACK answers this peer's PING to a silent seed (peer_link.rb); the
+      # reader counted the link heard when it read the frame.
+      when "ACK" then nil
+      when "DIGEST" then on_digest(sender, body, relayed)
       when "PIPE_DATA" then on_pipe(sender, Wire.decode_body(kind, body))
       when "RELAY_FRAME"
         relay = Wire.decode_body(kind, body)
@@ -985,6 +1281,7 @@ module AgentSpaces
         if block["bytes"].is_a?(String) && @block_asked.key?(block["cid"]) && Wire.block_cid(block["bytes"]) == block["cid"]
           @blocks[block["cid"]] = block["bytes"]
           wake_fold_waiters
+          sweep_hint(now_ms) # a lapsed entry's EXPIRED may have waited on its value
         end
       when Wire::KIND_GROUP_AD then on_group_ad(body)
       when "RUMOR" then on_rumor(Wire.decode_body(kind, body))
@@ -1101,6 +1398,9 @@ module AgentSpaces
       previous = @ads[id]
       @ad_bytes += entry["bytes"] - previous.to_h["bytes"].to_i
       @ads[id] = entry
+      @ads_version += 1
+      @ads_changed.broadcast
+      entry
     end
 
     def ad_fits?(id, entry)
@@ -1164,20 +1464,30 @@ module AgentSpaces
       dialer = dialer_for(seed.scheme)
       raise IOError, "no dialer serves the #{seed.scheme} scheme" if dialer.nil?
 
-      @channel = dialer.open(seed, identity: @identity, timeout: timeout)
-      @link_since = monotonic
+      adopt_channel(seed, dialer.open(seed, identity: @identity, timeout: timeout))
+    end
+
+    # Takes a channel just dialled to seed as this peer's link.
+    def adopt_channel(seed, channel)
+      @channel = channel
+      @link_since = redial_clock
       @session = nil # a session ends with its connection
+      previous = @seed
       @seed = seed
+      adopt_link_holder(previous)
       @running = true
-      start_thread("agentspaces-reader") { read_loop }
-      start_thread("agentspaces-ticker") { tick_loop } if @threads.none? { |t| t.name == "agentspaces-ticker" }
+      @dialled = true
+      link_opened
+      # The caller introduces this peer at once (connect, a join by id), so
+      # the keepalive's period counts from the dial.
+      @introduced_at = @time.mono
+      @reader = start_thread("agentspaces-reader") { read_loop }
+      start_loop
     end
 
     def start_thread(name, &block)
-      thread = Thread.new do
-        Thread.current.name = name
-        block.call
-      end
+      thread = Thread.new(&block)
+      thread.name = name # set by the spawner: the name is there from the start
       thread.report_on_exception = false
       @threads << thread
       thread
@@ -1209,10 +1519,17 @@ module AgentSpaces
     def read_loop
       while @running
         channel = @channel
-        break if channel.nil?
+        if channel.nil?
+          # A reader the watchdog started again after its predecessor died
+          # finds no channel: it dials as after a lost connection.
+          break unless @seed && reconnect
+
+          next
+        end
 
         begin
           frame = channel.read_frame
+          link_heard # any frame shows the seed still reads and writes the link
           begin
             env, auth = Wire.decode_frame_detailed(frame, attested: channel.attested_peer,
                                                           session: @session&.established)
@@ -1221,7 +1538,7 @@ module AgentSpaces
             if env.nil?
               @malformed_frames += 1
             elsif accepts?(env)
-              handle(env)
+              handle_timed(env)
             end
           rescue StandardError
             # One hostile frame must not kill the reader (ASF-015).
@@ -1235,46 +1552,38 @@ module AgentSpaces
       end
     end
 
-    # Re-leases the self-advertisement on the advertisement interval, so a
-    # long-running peer stays a member past the advertisement's TTL.
-    def tick_loop
-      last = monotonic
-      while @running
-        sleep 0.25
-        next unless monotonic - last >= @peer_ad_interval
-
-        last = monotonic
-        introduce if connected?
-      end
-    end
-
+    # The seeds of a round of dials, in the order dial_first staggers them:
+    # the list in its order with the seed just lost moved last, never a
+    # rotation (Harmonization, rule 2, the same order in every client).
     def candidate_seeds
       return @seed ? [@seed] : [] if @seeds.empty?
+      return @seeds.dup unless @seeds.include?(@seed)
 
-      index = @seeds.index(@seed)
-      index.nil? ? @seeds.dup : @seeds[(index + 1)..] + @seeds[0..index]
+      @seeds.reject { |seed| seed == @seed } + [@seed]
     end
 
-    # After a lost connection: dials again (every seed, the next first), then
-    # re-introduces and re-pulls (ROBUSTNESS.md 3.6). The pauses between rounds
-    # back off from reconnect_interval to six times it (5, 10, 20, 30 s) with a
-    # random spread, so the clients of a seed that restarts do not all dial it at
-    # once, and the dials go on until the owner closes the peer (swarm retries,
-    # ROBUSTNESS.md 10.3 E5). A link that ended within reconnect_interval of
-    # its dial counts as a failed round, so a seed that accepts each dial and
-    # drops it at once gets the same pauses and no dial loop (ROBUSTNESS.md
-    # 10.6). A bootstrapped peer reads its beacon document again every
+    # After a lost connection: dials again (every seed, staggered 250 ms in
+    # list order, the seed just lost last), then re-introduces and
+    # re-pulls (ROBUSTNESS.md 3.6). The pauses between failed rounds follow
+    # the redial table (REDIAL_TABLE: 5, 10, 20, 30 s, then 5 s again) with a
+    # random spread, so the clients of a seed that restarts do not all dial it
+    # at once, and the dials go on until the owner closes the peer (swarm
+    # retries, ROBUSTNESS.md 10.3 E5). A link that ended within
+    # reconnect_interval of its dial counts as a failed round, so a seed that
+    # accepts each dial and drops it at once gets the same pauses and no dial
+    # loop (ROBUSTNESS.md 10.6); only a link that held (and a wake) starts
+    # the table again (Harmonization, rule 1). A
+    # bootstrapped peer reads its beacon document again every
     # reconnect_window with nothing reachable, and keeps the seeds it has when
     # the beacon is unreachable too.
     def reconnect
-      if monotonic - @link_since < @reconnect_interval
-        @quick_drops += 1
-        sleep(reconnect_pause(@quick_drops))
+      if redial_clock - @link_since < @reconnect_interval
+        # A wake (resume) cuts the pause short: the network may be back.
+        reconnect_wait(redial_pause)
       else
-        @quick_drops = 0
+        redial_reset
       end
       deadline = monotonic + @reconnect_window
-      rounds = 0
       while @running
         if monotonic >= deadline
           deadline = monotonic + @reconnect_window
@@ -1287,17 +1596,23 @@ module AgentSpaces
             @seeds = fresh unless fresh.empty?
           end
         end
-        candidate_seeds.each do |seed|
-          return false unless @running
+        redial_started
+        return false unless @running
 
-          begin
-            @channel = dialer_for(seed.scheme).open(seed, identity: @identity)
-            @link_since = monotonic
-            @session = nil
-          rescue SystemCallError, IOError, SocketError, OpenSSL::SSL::SSLError
-            next
+        seed, channel, = dial_first(candidate_seeds)
+        if channel
+          unless @running
+            channel.close
+            return false
           end
+
+          @channel = channel
+          @link_since = redial_clock
+          @session = nil
+          previous = @seed
           @seed = seed
+          adopt_link_holder(previous)
+          link_opened
           @reconnects += 1
           introduce
           announce_channel
@@ -1306,16 +1621,12 @@ module AgentSpaces
           @pulled_spaces.to_a.each { |space| pull_space(space) }
           return true
         end
-        rounds += 1
-        sleep(reconnect_pause(rounds))
+        return false unless @running
+
+        # A wake (resume) cuts the pause short and dials at once, from the table's start.
+        reconnect_wait(redial_pause)
       end
       false
-    end
-
-    # The pause after the rounds-th failed round of dials: reconnect_interval
-    # doubling to six times it, with a random spread of up to a quarter.
-    def reconnect_pause(rounds)
-      [6 * @reconnect_interval, @reconnect_interval * (2**[rounds - 1, 3].min)].min * (1 + (rand / 4))
     end
 
     def notify_observers
@@ -1323,17 +1634,6 @@ module AgentSpaces
         yield observer
       rescue StandardError => e
         @logger&.warn("agentspaces: observer failed: #{e.class}: #{e.message}")
-      end
-    end
-
-    def sweep_loop
-      until @closed
-        sleep 0.25
-        @observers.dup.each do |observer|
-          observer.sweep if observer.watching?
-        rescue StandardError
-          nil
-        end
       end
     end
 
@@ -1347,12 +1647,14 @@ module AgentSpaces
       return unless channel.attested_peer.nil?
 
       session = (@session ||= Session.new(@identity.peer_id))
-      send_session_hello(session, peer, nil) if session.may_open?(now_ms)
+      # The retry is a local period: on the monotonic base, so a wall step
+      # neither holds it back nor fires it early (SPEC 9.5).
+      send_session_hello(session, peer, nil) if session.may_open?(local_ms)
     end
 
     # Sends this peer's half (opening when echo is nil), fully signed.
     def send_session_hello(session, peer, echo)
-      session.sent!(now_ms, !echo.nil?)
+      session.sent!(local_ms, !echo.nil?)
       env = Wire.envelope(@group, "SESSION_HELLO", @identity.peer_id, Wire.hlc_now(@identity.peer_id, now_ms),
                           session.hello(peer, echo), peer)
       @channel&.send_frame(Wire.encode_frame(env, @identity))
@@ -1417,10 +1719,19 @@ module AgentSpaces
       end
     end
 
+    # A PULL_RESP: its deltas fold, then a budgeted pull whose answer left
+    # states out asks again (SPEC annex I.6, RE-L-03), when the answer
+    # changed something here.
+    def on_pull_resp(resp)
+      changes = change_count
+      fold_pull_resp(resp)
+      continue_budgeted_pulls(resp["remainder"], change_count > changes)
+    end
+
     # One delta per stream. A delta that does not decode drops alone, and
     # the peer folds the rest of the response (HLC round four, 2026-11-08 (D5)):
     # a space delta counts in deltas_undecodable, any other in malformed_frames.
-    def on_pull_resp(resp)
+    def fold_pull_resp(resp)
       resp["deltas"].each do |stream, delta_bytes|
         next if delta_bytes.empty?
 
@@ -1430,6 +1741,19 @@ module AgentSpaces
 
           (sync["claims"] || {}).each { |entry_id, signed| fold_claim(entry_id, signed) }
           (sync["states"] || []).each { |dto| fold_state(dto) }
+          next
+        end
+        if stream == "view"
+          # The signed cards of the members the view digest did not name
+          # (SPEC 5.2): each admitted as a forwarded copy on "peers" would be.
+          payloads = begin
+            CBOR.load(delta_bytes)
+          rescue CBOR::Error
+            @malformed_frames += 1
+            next
+          end
+          Array(payloads).each { |payload| accept_peer_ad(payload) if payload.is_a?(String) }
+          view_answered # the re-probe after a wake has its answer (peer_loop.rb)
           next
         end
         record = PULL_DELTAS[stream]
@@ -1466,8 +1790,9 @@ module AgentSpaces
 
     # HLC round six, 2026-11-08 (R10): drops each claim on an entry this
     # replica does not hold once the claim's expiry passes, so claims on
-    # entries it never held (this peer collects no entry) cannot grow the
-    # claim map without bound. It runs between carriers, never inside one, so
+    # entries it never held cannot grow the claim map without bound (an
+    # entry it collects past its horizon takes its claim with it,
+    # collect_garbage). It runs between carriers, never inside one, so
     # a completion still finds the claim it travels with, and it runs when
     # the map has doubled since the last pass, so the work stays proportional
     # to the claims folded.
@@ -1520,7 +1845,15 @@ module AgentSpaces
       ad = Schema.load("PeerAdvertisement", ad_bytes)
       return unless ad["issuer"] == Derive.id(key) && ad["issuer"] != @identity.peer_id
 
+      held = @members[ad["issuer"]]
+      # Gossip and anti-entropy can hand an older card over after a newer one. It never
+      # replaces the newer card's hints: a member that dropped wire.horizon=1 would count as
+      # hinted again, and the per-entry horizon would trust a writer that no longer promises
+      # the renewal rule (SPEC 7.3), as Java's AdCache and the Python peer keep the newest.
+      return if held && held["issued"] && Instants.parse_millis(held["issued"]) > Instants.parse_millis(ad["issued"])
+
       @members[ad["issuer"]] = ad
+      note_member_card(ad)
       if @channel_auth == :session && (ad["resourceHints"] || {})[Session::HINT] == "1"
         @session_peers << ad["issuer"]
       else
@@ -1583,7 +1916,12 @@ module AgentSpaces
 
     # Counts a verified state refused for its stamps, under reason :logical
     # or :far_future.
-    def refuse_state(dto, record, reason) = refuse_offer(state_offer_key(dto, record), reason)
+    # The refused line is acknowledged in this replica's digest (SPEC 7.3,
+    # Counting a refusal), so a partner answering it stops offering the state.
+    def refuse_state(dto, record, reason)
+      acknowledge(record["spaceId"], TextDigest.state_line(record["entryId"], dto))
+      refuse_offer(state_offer_key(dto, record), reason)
+    end
 
     # Counts a verified claim refused for its stamp, under reason :logical
     # or :far_future.
@@ -1661,7 +1999,9 @@ module AgentSpaces
       (Array(dto["adds"]) + Array(dto["removes"])).all? { |dot| dot.is_a?(Hash) && dot["replica"] == issuer_peer }
     end
 
-    def verify_state(dto, record)
+    # claim_signed: the claim a completion is judged under (a displaced
+    # holder's, peer_settle.rb); the held claim by default.
+    def verify_state(dto, record, claim_signed = nil)
       issuer_key = dto["issuerPublicKey"]
       return false unless issuer_key.is_a?(String) && issuer_key.bytesize == 32
 
@@ -1671,7 +2011,7 @@ module AgentSpaces
       return false unless state_sig.is_a?(String)
 
       if dto["completed"]
-        signed = @claims[record["entryId"]]
+        signed = claim_signed || @claims[record["entryId"]]
         return false unless signed
 
         claim = signed["claim"] || {}

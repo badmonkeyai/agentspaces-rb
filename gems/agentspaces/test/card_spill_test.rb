@@ -244,7 +244,7 @@ class CardSpillTest < Minitest::Test
     error = assert_raises(Peer::ResolveError) { reader.resolve(app_stub) }
     assert_match(/no content swarm/, error.message)
     assert_equal Cards::CARD_SPILL_MAX_FETCH_BYTES, reader.spill_max_fetch_bytes
-    small = peer(spill_max_fetch_bytes: 451)
+    small = peer(spill_max_fetch_bytes: 448)
     small.spill_store = store = MemoryStore.new
     assert_raises(Peer::ResolveError) { small.resolve(app_stub) }
     assert_equal 1, small.spills_over_limit
@@ -268,11 +268,11 @@ class CardSpillTest < Minitest::Test
 
   def test_a_document_that_does_not_complete_its_stub_is_refused_and_counted
     document = hex("app_card_parts_cbor")
-    assert_match(/453 bytes; the stub states 452/, refused(app_stub, document + "\x00".b))
+    assert_match(/450 bytes; the stub states 449/, refused(app_stub, document + "\x00".b))
     longer = app_stub.merge("spill" => app_stub["spill"].merge("size" => document.bytesize + 1))
-    assert_match(/452 bytes; the stub states 453/, refused(longer, document), "a document of another length than spill.size")
+    assert_match(/449 bytes; the stub states 450/, refused(longer, document), "a document of another length than spill.size")
     wrong_parts = CBOR.dump(app_parts.merge("views" => []))
-    ["\xFF".b * 452, wrong_parts + ("\x00".b * (452 - wrong_parts.bytesize))].each do |served|
+    ["\xFF".b * 449, wrong_parts + ("\x00".b * (449 - wrong_parts.bytesize))].each do |served|
       message = refused(naming(app_stub, served), served)
       refute_match(/content root|the stub states|the parts document holds/, message, "a document that does not decode")
     end
@@ -333,7 +333,7 @@ class CardSpillTest < Minitest::Test
     stub = app_stub.merge("issuer" => issuer.peer_id, "id" => "aspace://zApps/app/#{issuer.peer_id}/example-board")
     reader = peer
     refute_nil reader.accept_ad(Wire.stored_ad("AppCard", stub, issuer))
-    reader.spill_store = MemoryStore.new(stub["spill"]["root"] => "\x00".b * 452)
+    reader.spill_store = MemoryStore.new(stub["spill"]["root"] => "\x00".b * 449)
     assert_raises(Peer::ResolveError) { reader.resolve(stub) }
     assert_equal stub, reader.ads[stub["id"]]["ad"]
   end

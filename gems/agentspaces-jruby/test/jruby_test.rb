@@ -119,6 +119,26 @@ class JRubyFaceTest < Minitest::Test
     worker&.close
   end
 
+  class Pool
+    include AgentSpaces::Agent
+    agent "jr-pool", description: "Ships orders three at a time"
+    take JShop::Order, space: "orders", concurrency: 3, produces: JShop::Shipment
+    def ship(order) = JShop::Shipment.new(order_id: order.order_id, item: order.item, by: "pool", weight: 1.0)
+
+    take JShop::Receipt, space: "orders"
+    def file(_receipt) = nil
+  end
+
+  # concurrency reaches @SpaceTake only when a clause names more than the default one loop.
+  def test_take_concurrency_compiles_to_the_space_take_attribute
+    names = { JShop::Order => "rbjr.shop.Order", JShop::Shipment => "rbjr.shop.Shipment",
+              JShop::Receipt => "rbjr.shop.Receipt" }
+    source = AgentSpaces::JRuby::JavaSource.interface(Pool.agentspaces_model, names).last
+    ship, file = source.lines.grep(/SpaceTake/)
+    assert_includes ship, "concurrency = 3"
+    refute_includes file, "concurrency"
+  end
+
   def test_hostile_option_values_never_reach_java_source_unescaped
     names = { JShop::Order => "rbjr.shop.Order" }
     literal = AgentSpaces::JRuby::JavaSource.literal("\"); System.exit(1); (\"\\ \n")

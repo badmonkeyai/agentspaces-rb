@@ -128,11 +128,12 @@ module AgentSpaces
           preverified || (store.error_depth.zero? && !ChannelCertificate.attest(store.current_cert).nil?)
         end
       end
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
       socket = Dialer.tcp(seed.host, seed.port, timeout)
       ssl = OpenSSL::SSL::SSLSocket.new(socket, context)
       ssl.sync_close = true
       ssl.hostname = seed.host unless ip?(seed.host)
-      ssl.connect
+      handshake(ssl, seed, timeout, deadline)
       attested = ChannelCertificate.attest(ssl.peer_cert)
       if attested.nil?
         if require_attested
@@ -143,8 +144,32 @@ module AgentSpaces
       end
       [ssl, attested]
     rescue StandardError
-      socket&.close unless ssl
+      # Whatever failed, the socket goes with the dial (an SSLSocket closes
+      # its socket, sync_close).
+      begin
+        (ssl || socket)&.close
+      rescue StandardError
+        nil
+      end
       raise
+    end
+
+    # The handshake within the dial's timeout: a remote whose kernel accepts
+    # the connection but that never answers the handshake would otherwise
+    # hold the dial (and, with seeds dialled concurrently, its thread and
+    # socket) for ever. Ends with IOError at the deadline.
+    def self.handshake(ssl, seed, timeout, deadline)
+      loop do
+        wait = ssl.connect_nonblock(exception: false)
+        return unless %i[wait_readable wait_writable].include?(wait)
+
+        left = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        # The TLS layer asked for bytes it does not hold, so a select on the
+        # socket sees what it waits for (MRI and JRuby alike).
+        io = [ssl.to_io]
+        ready = left.positive? && (wait == :wait_readable ? IO.select(io, nil, nil, left) : IO.select(nil, io, nil, left))
+        raise IOError, "no TLS answer from #{seed} in #{timeout}s" unless ready
+      end
     end
 
     def self.ip?(host)

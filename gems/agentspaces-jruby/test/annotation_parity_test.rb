@@ -23,7 +23,9 @@ require "agentspaces/jruby"
 # here as one the DSL leaves to its default. A new attribute in the core
 # fails this test until the table below or the DSL says what to do with it.
 class AnnotationParityTest < Minitest::Test
-  # Ruby-only options: produces on verbs whose Java return type carries it.
+  # Ruby-only options: produces on verbs whose Java return type carries it;
+  # on_estimate's epochs (Java's prefix) and ticks (Java's settleTicks,
+  # deprecated there since 0.7.0: see DEPRECATED).
   RUBY_ONLY = { on_decision: %w[produces], on_estimate: %w[epochs ticks produces], reduce: [] }.freeze
 
   # Java attributes the DSL leaves at their defaults, with the reason.
@@ -32,8 +34,14 @@ class AnnotationParityTest < Minitest::Test
     propose: %w[subscriptionLease],               # renewed by the binder at half-lease
     join: %w[name settle lease ticketLease takeLease pollTimeout],  # LEASED and ORDERED tuning
     reduce: %w[name accumulatorLease subscriptionLease],
-    on_estimate: %w[prefix settleTicks tolerance group resultSpace resultLease description]
+    on_estimate: %w[prefix tolerance group resultSpace resultLease description]
   }.freeze
+
+  # Java attributes deprecated in the core that the DSL carries under
+  # another name, never as the deprecated attribute itself: on_estimate's
+  # settleTicks is the DSL's ticks:, kept for one release beside settle:
+  # (DRIFT-FROM-PHASE6 item 6; Java's settle is the DSL's settle: by name).
+  DEPRECATED = { on_estimate: %w[settleTicks] }.freeze
 
   JAVA = { take: "SpaceTake", notify: "SpaceNotify", bid: "BidFunction", ballot: "Ballot", on_decision: "OnDecision",
            propose: "Propose", join: "SpaceJoin", ordered_take: "OrderedTake", reduce: "SpaceReduce",
@@ -53,8 +61,31 @@ class AnnotationParityTest < Minitest::Test
       extra -= %w[options vote quorum] if verb == :propose
       extra -= %w[mode] if verb == :join && java.include?("mode")
       assert_empty extra, "#{verb}: options with no Java attribute"
-      missing = java - ruby - JAVA_DEFAULTS.fetch(verb, [])
+      missing = java - ruby - JAVA_DEFAULTS.fetch(verb, []) - DEPRECATED.fetch(verb, [])
       assert_empty missing, "#{verb}: Java attributes the DSL does not carry"
     end
+  end
+
+  # Each deprecated attribute is one the core still declares deprecated, so
+  # the list cannot outlive the attribute unnoticed.
+  def test_the_deprecated_attributes_are_deprecated_in_the_core
+    DEPRECATED.each do |verb, names|
+      annotation = Java::JavaLang::Class.forName("ai.badmonkey.agentspaces.agent.annotation.#{JAVA.fetch(verb)}",
+                                                 true, AgentSpaces::JRuby.loader)
+      names.each do |name|
+        method = annotation.getDeclaredMethod(name)
+        refute_nil method.getAnnotation(Java::JavaLang::Deprecated.java_class), "#{verb}: #{name} is deprecated in the core"
+      end
+    end
+  end
+
+  # The DSL's settle: is Java's settle by name, so an unruled clause and
+  # the Java default agree (8 s).
+  def test_settle_is_carried_by_name
+    annotation = Java::JavaLang::Class.forName("ai.badmonkey.agentspaces.agent.annotation.OnEstimate", true,
+                                               AgentSpaces::JRuby.loader)
+    assert_includes annotation.getDeclaredMethods.map(&:getName), "settle"
+    assert_includes AgentSpaces::Agent::OPTIONS[:on_estimate].keys, :settle
+    assert_equal "PT8S", AgentSpaces::Binder::ESTIMATE_SETTLE
   end
 end

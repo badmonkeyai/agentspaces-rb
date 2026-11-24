@@ -72,9 +72,19 @@ namespace :jruby do
     build_gem("agentspaces-jruby")
   end
 
-  desc "The JRuby face suite (run under jruby)"
+  desc "The JRuby face suite (run under jruby; needs `rake jruby:jars`)"
   task :test do
-    sh "jruby -Igems/agentspaces/lib -Igems/agentspaces-jruby/lib -e 'Dir[%(gems/agentspaces-jruby/test/*_test.rb)].each { |f| require File.expand_path(f) }'"
+    abort "gems/agentspaces-jruby/jars is empty; run `rake jruby:jars` first" if Dir["gems/agentspaces-jruby/jars/*.jar"].empty?
+    command = "jruby -Igems/agentspaces/lib -Igems/agentspaces-jruby/lib -e " \
+              "'Dir[%(gems/agentspaces-jruby/test/*_test.rb)].each { |f| require File.expand_path(f) }'"
+    # Under `bundle exec` on MRI (rake gate), the child would inherit the MRI
+    # bundle (RUBYOPT=-rbundler/setup, BUNDLE_GEMFILE) and find none of
+    # JRuby's own default gems (bigdecimal): it runs outside that bundle.
+    if defined?(Bundler) && RUBY_ENGINE != "jruby"
+      Bundler.with_unbundled_env { sh command }
+    else
+      sh command
+    end
   end
 end
 
@@ -87,6 +97,11 @@ def build_gem(name)
     sh "gem build #{name}.gemspec --output ../../pkg/#{name}-#{AgentSpaces::VERSION}#{name == 'agentspaces-jruby' ? '-java' : ''}.gem"
   end
 end
+
+# DRIFT-FROM-PHASE6 item 6: the JRuby face's suite (AnnotationParityTest
+# among it) in a local gate, as CI's jruby-face job runs it.
+desc "Every MRI suite, then the JRuby face's (needs jruby and `rake jruby:jars`)"
+task gate: %i[all jruby:test]
 
 desc "Build the four pure-Ruby gems into pkg/"
 task :build do

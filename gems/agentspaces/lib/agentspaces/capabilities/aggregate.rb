@@ -17,8 +17,9 @@
 module AgentSpaces
   module Capabilities
     # When an estimate counts as settled: unchanged within a relative
-    # tolerance for ticks consecutive ticks; Settle::FIRST is the first
-    # estimate present.
+    # tolerance for ticks consecutive gossip rounds of Aggregate::ROUND_PERIOD
+    # (about a second each, as Java's PushSumAggregate.Settle since SPEC
+    # v0.1.36 §8 and §9.5); Settle::FIRST is the first estimate present.
     Settle = Data.define(:ticks, :tolerance) do
       def initialize(ticks: 0, tolerance: 0.0)
         ticks = Integer(ticks)
@@ -28,7 +29,27 @@ module AgentSpaces
         super(ticks: ticks, tolerance: tolerance)
       end
 
-      def self.after(ticks, tolerance) = new(ticks: ticks, tolerance: tolerance)
+      # after(8, t) counts eight rounds; after("PT8S", t), after("8s", t) or
+      # after(8.0, t) is the same rule in time: the span in rounds of
+      # ROUND_PERIOD, rounded up (Java's Settle.after(Duration, double)).
+      def self.after(ticks_or_span, tolerance)
+        return new(ticks: ticks_or_span, tolerance: tolerance) if ticks_or_span.is_a?(Integer)
+
+        span(ticks_or_span, tolerance)
+      end
+
+      # A settle rule in time: the estimate unchanged for span (a duration as
+      # Durations reads it), counted in rounds of ROUND_PERIOD, rounded up.
+      def self.span(span, tolerance)
+        millis = Durations.millis(span)
+        raise ArgumentError, "a settle span is not negative: #{span.inspect}" if millis.negative?
+
+        round = (Aggregate::ROUND_PERIOD * 1000).round
+        new(ticks: (millis + round - 1) / round, tolerance: tolerance)
+      end
+
+      # How long the rule asks an estimate to stay unchanged, in seconds.
+      def span_seconds = ticks * Aggregate::ROUND_PERIOD
 
       # Whether current is within the tolerance of previous, relative to the larger.
       def stable?(previous, current)
@@ -50,11 +71,23 @@ module AgentSpaces
     #
     #   aggregate = Aggregate.new(pipes)
     #   aggregate.start("load", 12.5)
-    #   aggregate.run(interval_seconds: 0.3)          # ticks on a thread
-    #   value = aggregate.await_settled("load", Settle.after(3, 0.01), timeout_seconds: 20)
+    #   aggregate.run                                 # one round a second on a thread
+    #   value = aggregate.await_settled("load", Settle.after("PT3S", 0.01), timeout_seconds: 20)
     class Aggregate
       TYPE = "aspace:cap/aggregate"
       MODES = %w[avg sum count min max].freeze
+      # One gossip round (Java's PushSumAggregate.ROUND_PERIOD since SPEC
+      # v0.1.36): a settle rule's ticks are rounds of this length.
+      ROUND_PERIOD = 1.0
+      # An epoch neither started here nor heard from for this long is quiet,
+      # as Java's push-sum epoch going quiet (SPEC 9.5: 30 s): with every
+      # epoch quiet and no watch waiting, the round thread sleeps until a
+      # frame, a start or a watch wakes it.
+      QUIET_AFTER = 30.0
+      # How often this node's aggregate card is published again (the card
+      # refresh Java's static providers live on: 5 minutes, half and more
+      # inside the card's 15 minutes).
+      CARD_REFRESH = 300.0
 
       attr_reader :pipes, :self_token
       attr_accessor :exchanged
@@ -69,12 +102,20 @@ module AgentSpaces
         @declared = {}
         @ticks = {}
         @watches = []
+        @heard_at = {} # epoch => monotonic seconds of its last frame or start
         @lock = Mutex.new
+        @wake = Thread::Queue.new
         @thread = nil
         @running = false
         @exchanged = false
         pipes.on_capability(TYPE, method(:on_frame))
-        advertise! if advertise && pipes.peer.respond_to?(:publish_ad)
+        return unless advertise && pipes.peer.respond_to?(:publish_ad)
+
+        advertise!
+        # The card (PT15M) is renewed on the card refresh while the
+        # aggregate runs, and at once after a suspend, by the peer's loop: a
+        # member pushes shares only to a member whose card is live.
+        @kept_card = pipes.peer.keep_card(CARD_REFRESH) { advertise! } if pipes.peer.respond_to?(:keep_card)
       end
 
       # ---------------------------------------------------------- participants
@@ -119,6 +160,7 @@ module AgentSpaces
 
         value = Float(value)
         @lock.synchronize do
+          @heard_at[epoch_id] = mono
           @declared[epoch_id] = mode
           if %w[avg sum].include?(mode)
             e = (@epochs[epoch_id] ||= [0.0, 0.0])
@@ -128,6 +170,7 @@ module AgentSpaces
           (@rosters[epoch_id] ||= Set.new) << @self_token if %w[sum count].include?(mode)
           merge_extremum(epoch_id, mode == "max", value) if %w[min max].include?(mode)
         end
+        @wake << true
         nil
       end
 
@@ -174,24 +217,43 @@ module AgentSpaces
       # its own value is the estimate (Java's tick does the same).
       def tick_alone = @exchanged = true
 
-      # Ticks on a thread until close.
-      def run(interval_seconds: 0.3)
+      # Runs a round every interval_seconds (ROUND_PERIOD by default) on a
+      # thread until close, while any epoch is active or a watch waits; with
+      # everything quiet the thread sleeps until a frame, a start or a new
+      # watch wakes it (SPEC 9.5: rounds at deadlines, no fixed-rate tick).
+      def run(interval_seconds: ROUND_PERIOD)
         return if @thread
 
         @running = true
         @thread = Thread.new do
-          Thread.current.name = "aggregate-tick"
+          Thread.current.name = "aggregate-round"
           while @running && @pipes.peer.connected?
-            tick
-            sleep(interval_seconds)
+            busy = active?
+            tick if busy
+            break unless @running
+
+            @wake.pop(timeout: busy ? interval_seconds : nil)
+            @wake.clear
           end
         end
         @thread.report_on_exception = false
         nil
       end
 
+      # Whether a round is worth running: an epoch started or heard within
+      # QUIET_AFTER, or a watch still waiting on an epoch.
+      def active?
+        now = mono
+        @lock.synchronize do
+          @heard_at.any? { |_, at| now - at < QUIET_AFTER } ||
+            @watches.any? { |w| w[:tracks].empty? || w[:tracks].values.any? { |t| !t[:fired] } }
+        end
+      end
+
       def close
+        @kept_card&.close
         @running = false
+        @wake << true
         @thread&.join(2)
         @thread = nil
       end
@@ -240,6 +302,7 @@ module AgentSpaces
 
         watch = { epochs: epochs, settle: settle, listener: listener, tracks: {} }
         @lock.synchronize { @watches << watch }
+        @wake << true
         -> { @lock.synchronize { @watches.delete_if { |w| w.equal?(watch) } } && nil }
       end
 
@@ -256,13 +319,24 @@ module AgentSpaces
 
       def known_epochs = Set.new(@epochs.keys) | @rosters.keys | @extrema.keys | @declared.keys
 
+      # The monotonic base of the round and the quiet span: the peer's time
+      # source when it has one.
+      def mono
+        peer = @pipes.peer
+        peer.respond_to?(:time) && peer.time ? peer.time.mono : Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      end
+
       # A tick counts toward a settle rule only when this node heard a frame
       # for the epoch since the track last judged it: halving keeps the local
       # ratio, so a node nobody pushes to is stable by construction and says
       # nothing about the fleet. A node with nobody to exchange with judges
-      # every tick, its own value being the only estimate there is.
+      # every tick, its own value being the only estimate there is. An epoch
+      # heard and then quiet for as long as the rule's span settles with no
+      # further frame (Java's EL-T-16: at its last move plus the settle span),
+      # so a watch here never waits on members that went quiet.
       def evaluate_watches(alone: false)
-        epoch_ids, watches = @lock.synchronize { [known_epochs.to_a, @watches.dup] }
+        epoch_ids, watches, heard = @lock.synchronize { [known_epochs.to_a, @watches.dup, @heard_at.dup] }
+        clock = mono
         epoch_ids.each do |epoch_id|
           ticks = @ticks[epoch_id] = @ticks.fetch(epoch_id, 0) + 1
           now = estimate(epoch_id)
@@ -272,14 +346,17 @@ module AgentSpaces
 
             track = (watch[:tracks][epoch_id] ||= { last: nil, stable: 0, fired: false, seen: 0 })
             next if track[:fired] || now.nil?
-            # No new evidence: the streak neither grows nor resets.
-            next if receipts <= track[:seen] && !alone
+
+            settle = watch[:settle]
+            quiet = receipts.positive? && receipts <= track[:seen] && heard.key?(epoch_id) &&
+                    clock - heard[epoch_id] >= settle.span_seconds && settle.stable?(track[:last], now)
+            # No new evidence: the streak neither grows nor resets, unless the epoch went quiet.
+            next if receipts <= track[:seen] && !alone && !quiet
 
             track[:seen] = receipts
-            settle = watch[:settle]
             track[:stable] = settle.stable?(track[:last], now) ? track[:stable] + 1 : 0
             track[:last] = now
-            next unless track[:stable] >= settle.ticks
+            next unless track[:stable] >= settle.ticks || quiet
 
             track[:fired] = true
             estimate = Estimate.new(epoch_id: epoch_id, mode: @declared.fetch(epoch_id, "avg"), value: now,
@@ -308,6 +385,7 @@ module AgentSpaces
         end
 
         @exchanged = true
+        @wake << true
         share = frame["share"]
         extremum = frame["extremum"]
         roster = frame["roster"]
@@ -315,7 +393,10 @@ module AgentSpaces
           part.is_a?(Hash) && part["epochId"].is_a?(String)
         end&.fetch("epochId")
         @lock.synchronize do
-          @received[heard] = @received.fetch(heard, 0) + 1 unless heard.nil?
+          unless heard.nil?
+            @received[heard] = @received.fetch(heard, 0) + 1
+            @heard_at[heard] = mono
+          end
           if share.is_a?(Hash) && share["epochId"].is_a?(String)
             value = share["value"]
             weight = share["weight"]

@@ -9,6 +9,85 @@ The first release, on SPEC v0.1.33 and wire version 3. Not yet on RubyGems.org.
 
 ### `agentspaces`
 
+- Replication by entry, SPEC v0.1.35 (srad/replication-by-entry.md RE-L-03,
+  2026-11-15).
+  - The renewal rule of §7.2. `renew_entry`, `Taken#renew` (`renew_claim`)
+    and `Subscription#renew` extend a lease to `max(current, now +
+    extension)`, so a renewal never shortens it. A renewal that would end
+    sooner returns the current expiry and sends nothing, and
+    `renewals_kept` counts it. The first such renewal of each space that
+    asked for less than the lease had left is logged once at info (RE-H-01,
+    as Java logs it); `renew_shortening_log = false` turns the line off and
+    the count runs on. A write renewal needs the issuer, an entry
+    present here, and a lease that has not lapsed here. A take renewal
+    needs a hold that has not lapsed. A renewal that fails raises
+    `ArgumentError` and sends nothing. `renew_entry` and `renew_claim`
+    return the expiry.
+  - The take lease of §7.4. A take wins only with a claim still live when it
+    judges the race, and `take_entry` raises `ArgumentError` at once for a
+    lease no longer than its settle window plus the follow-up wait
+    (`Peer.take_judged_within_millis`, 900 ms for the default 0.6 s
+    window), as Java and TypeScript refuse it. Before, a take whose claim
+    lapsed while it waited could return the entry as held.
+  - The collection horizons of §7.3.
+    - The peer collects entries now, where it used to hold every entry it
+      ever saw. A lapse is kept `min(2 × maxLease, 5 min)` past its expiry.
+      A completion is kept `2 × maxLease`. A withdrawal is kept `max(2 ×
+      maxLease, MAX_DRIFT)`, and the drift floor of ten minutes applies
+      under both rules.
+    - The peer advertises `wire.horizon=1` (`horizon: :legacy` advertises
+      nothing). While it and every member in its view carry the hint, a
+      withdrawal is kept `max(5 min, MAX_DRIFT)` past its own expiry.
+    - The mode engages after three fully hinted rounds and one maximum
+      lease plus five minutes, and disengages at once. It applies only to
+      a withdrawal whose writers the peer vouches for: itself, or hinted
+      members in view for one maximum lease plus five minutes.
+    - `collect_garbage` runs every five seconds on a connected peer. It
+      drops the state, its claim, a block no entry names, and the watch
+      marks. The door refuses a state offered past its horizon
+      (`states_refused_collected`) and acknowledges it in the peer's text
+      digest. `horizon_mode(space)` and `max_lease_millis(space)` report.
+  - The budgeted get-space of annex I.6. Toward a seed whose card carries
+    `wire.ae=2`, `pull_space` sends the revocation streams unbudgeted, then
+    the space under `pull_budget` (1 MiB by default, `nil` for none). The
+    space travels by the peer's text digest (`e:` and `c:` lines with Java's
+    state and claim hashes, and `a:` lines for refused states), or by the
+    empty digest when the peer holds none of the space. While an answer's
+    `remainder` counts states left out and the answer changed something,
+    the peer asks again with its digest (`pull_continuations`). Otherwise
+    it stops and counts `pulls_stalled`, and the next pull repairs the rest.
+    `Bodies.Digest` names `budget`, which must be positive, and
+    `Bodies.PullResp` names `remainder`, which is never negative. `tree`,
+    `ids` and `sketch` stay unnamed, so a `DIGEST` carrying one is
+    undecodable here, and the peer still acts on no `DIGEST`.
+  - Completed on arrival (§7.2). An entry first learned completed raises
+    `COMPLETED` and never `WRITTEN` or `TAKEN`. It raises nothing when its
+    block is not held here, and the peer fetches no block for that event.
+    `WRITTEN` is raised only for an entry present and unexpired when it
+    merges, as Java raises it; one learned already lapsed raises nothing.
+  - The adversarial review (2026-11-15, `rbe_adversary_test.rb`).
+    - `renew_entry` and `complete_entry` write back only over the state
+      they read. A cancel that folded while a renewal signed was
+      overwritten, so the entry was live again here and the renewal carried
+      a lease past the withdrawal's own to every replica.
+    - A reordered older peer card no longer replaces a newer one, so a
+      member that dropped `wire.horizon=1` never counts as hinted again.
+    - `Taken` keeps its own holder rather than reading the claim back after
+      the take, so a rival claim that folded in between fails the
+      completion check. `Taken#renew` renews only the take's own claim
+      (`renew_claim` takes `holder:` and `epoch:`).
+  - A `ballot` or `on_decision` binding also reads the proposals already
+    held when it binds (R2, 2026-11-16). A member that joined and bound its
+    agent after the proposal came by rumor never cast: a budgeted pull
+    carries this replica's own digest, so the proposal was never sent again
+    to raise `WRITTEN` for the new watch. Each proposal is still judged
+    once.
+  - Golden coverage. `renew_clamp_cases`, `lapse_horizon_cases` and all 64
+    rows of `horizon_mode_cases` are reproduced, `space_state_hash`,
+    `space_claim_hash` and `java_double_strings` drive the text digest, and
+    the budgeted get-space and the `PULL_RESP` with `remainder` are the
+    golden bodies byte for byte.
+
 - SPEC v0.1.32 cards (AppCard origin and formats, 2026-11-09). The schema
   reads `AppCard.origin`, `AppCard.formats`, and `spill` on both card kinds,
   with the records `AppCard.Origin`, `AppCard.Parts`, `AgentCard.Parts`, and

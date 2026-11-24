@@ -77,6 +77,12 @@ module AgentSpaces
   # otherwise. The card is published on bind and republished every
   # card_refresh seconds while the agent stays bound.
   class Binder
+    # How many held proposals a vote binding reads when it binds (start_ballot): far past any
+    # vote space in practice, and a bound on the work a bind does.
+    BIND_SWEEP_LIMIT = 10_000
+    # An on_estimate clause with neither settle: nor ticks: waits this long, as Java's @OnEstimate does.
+    ESTIMATE_SETTLE = "PT8S"
+
     attr_reader :peer, :agent, :agent_name
 
     def initialize(peer, agent: nil, agent_name: nil, publish_card: true, card_ttl: "PT10M", card_refresh: 300,
@@ -111,6 +117,7 @@ module AgentSpaces
                                       clause.location)
         end
       end
+      check_ttls(object, model)
       fill_refs(object, model)
       consumes = []
       produces = []
@@ -165,6 +172,32 @@ module AgentSpaces
 
     private
 
+    # The TTL floor (TtlFloor) over every lease and expiry the clauses name,
+    # each against its clause default, and the card refresh against the card
+    # TTL it renews; a warning (or, under strict, TtlFloorError) before
+    # anything starts.
+    def check_ttls(object, model)
+      floor = @peer.respond_to?(:ttl_floor) ? @peer.ttl_floor : nil
+      return if floor.nil?
+
+      owner = object.class.name || model.name
+      model.clauses.each do |clause|
+        defaults = Agent::OPTIONS.fetch(clause.verb, {})
+        Agent::TTL_OPTIONS.each do |option|
+          value = clause.options[option]
+          next if value.nil?
+
+          default = defaults[option]
+          floor.check("binder.#{owner}.#{clause.method_name}.#{option}", Durations.millis(value),
+                      registered_default: default.is_a?(String) ? Durations.millis(default) : nil,
+                      override_reason: clause.options[:ttl_override])
+        end
+      end
+      return unless @publish_card
+
+      floor.check_cycle("binder.#{owner}.card-refresh", Durations.millis(@card_ttl), Durations.millis(@card_refresh))
+    end
+
     def model_of(object)
       unless object.class.respond_to?(:agentspaces_model)
         raise ArgumentError, "#{object.class} does not include AgentSpaces::Agent"
@@ -212,7 +245,15 @@ module AgentSpaces
       card
     end
 
+    # The card is renewed by the peer's loop (Peer#keep_card): on its
+    # refresh, and at once after a forward wall step or a suspend; a peer
+    # without that loop renews it on a thread of the agent's.
     def start_card_refresh(bound, publish)
+      if @peer.respond_to?(:keep_card)
+        bound.add_subscription(@peer.keep_card(Durations.millis(@card_refresh) / 1000.0) { publish.call })
+        return
+      end
+
       spawn(bound, "card") do
         until bound.wait_stopped(@card_refresh)
           begin
@@ -327,40 +368,53 @@ module AgentSpaces
       template = template_for(clause)
       lease = clause.options[:lease]
       poll = clause.options[:poll_timeout]
-      spawn(bound, clause.method_name.to_s) do
-        while bound.running? && @peer.connected?
-          taken = begin
-            space.take(template, lease: lease, timeout: poll)
-          rescue StandardError => e
-            log(bound, "#{clause.method_name} take", e)
-            bound.wait_stopped(0.5)
-            next
-          end
-          next if taken.nil?
+      # As the Java binder does for @SpaceTake(concurrency): each loop takes and
+      # serves one entry at a time, so a slow body serves that many entries at once.
+      loops = clause.options.fetch(:concurrency, 1)
+      loops.times do |i|
+        label = loops == 1 ? clause.method_name.to_s : "#{clause.method_name}.#{i + 1}"
+        spawn(bound, label) { take_loop(bound, method, clause, space, template, lease, poll) }
+      end
+    end
 
-          result = begin
-            TakeContext.with(taken) { method.arity == 1 ? method.call(taken.value) : method.call(taken.value, taken) }
-          rescue StandardError => e
-            # The lease lapses and the entry reappears for another worker.
-            bound.failed!
-            log(bound, "#{clause.method_name} (entry #{taken.entry_id})", e)
-            next
+    def take_loop(bound, method, clause, space, template, lease, poll)
+      while bound.running? && @peer.connected?
+        taken = begin
+          space.take(template, lease: lease, timeout: poll)
+        rescue StandardError => e
+          log(bound, "#{clause.method_name} take", e)
+          bound.wait_stopped(0.5)
+          next
+        end
+        next if taken.nil?
+
+        # The handler's own renewals (Lease.keepalive, taken.renew) end with
+        # the binding: an unbound agent's hung handler cannot keep the entry
+        # (item 11 of DRIFT-FROM-PHASE6, as the core's TakeContext.renew).
+        taken.guard = -> { bound.running? ? nil : "#{bound.name} is unbound" }
+        result = begin
+          TakeContext.with(taken) { method.arity == 1 ? method.call(taken.value) : method.call(taken.value, taken) }
+        rescue StandardError => e
+          # The lease lapses and the entry reappears for another worker.
+          taken.send(:abandon!)
+          bound.failed!
+          log(bound, "#{clause.method_name} (entry #{taken.entry_id})", e)
+          next
+        end
+        begin
+          if result.nil? || result.is_a?(Motion) || result.is_a?(Contribution) || result.is_a?(Array) ||
+             clause.options[:result_space]
+            # The take is finished first: a failed open or fork cannot make
+            # a completed task reappear (ISSUE-Motion FR-4).
+            taken.complete
+            write_result(bound, clause, result, space)
+          else
+            value = result.is_a?(Tagged) ? result.value : result
+            check_produces(bound, clause, value)
+            taken.complete(value, lease: clause.options[:result_lease], tags: result.is_a?(Tagged) ? result.tags : nil)
           end
-          begin
-            if result.nil? || result.is_a?(Motion) || result.is_a?(Contribution) || result.is_a?(Array) ||
-               clause.options[:result_space]
-              # The take is finished first: a failed open or fork cannot make
-              # a completed task reappear (ISSUE-Motion FR-4).
-              taken.complete
-              write_result(bound, clause, result, space)
-            else
-              value = result.is_a?(Tagged) ? result.value : result
-              check_produces(bound, clause, value)
-              taken.complete(value, lease: clause.options[:result_lease], tags: result.is_a?(Tagged) ? result.tags : nil)
-            end
-          rescue StandardError => e
-            log(bound, "#{clause.method_name} complete", e)
-          end
+        rescue StandardError => e
+          log(bound, "#{clause.method_name} complete", e)
         end
       end
     end
@@ -381,8 +435,7 @@ module AgentSpaces
       lease_ms = Durations.millis(clause.options[:lease])
       cast_for = Set.new
       lock = Mutex.new
-      subscription = space.watch(Votes::PROPOSAL_TYPE) do |event|
-        proposal = event.value.payload
+      consider = lambda do |proposal|
         pid = proposal["proposalId"]
         next unless pid.is_a?(String) && pid.start_with?(prefix)
         next unless lock.synchronize { cast_for.add?(pid) }
@@ -397,7 +450,12 @@ module AgentSpaces
           end
         end
       end
-      bound.add_subscription(subscription)
+      bound.add_subscription(space.watch(Votes::PROPOSAL_TYPE) { |event| consider.call(event.value.payload) })
+      # A proposal that folded before this binding existed raises no WRITTEN for it: a member that
+      # binds after it joins (the proposal came by rumor first) still owes its ballot, and a pull
+      # with this replica's own digest never sends that proposal again. So the binding reads the
+      # open proposals it already holds; the watch is in place first, and cast_for casts once.
+      space.entries(Votes::PROPOSAL_TYPE, limit: BIND_SWEEP_LIMIT).each { |held| consider.call(held.value.payload) }
     end
 
     def start_decision(bound, method, clause)
@@ -419,6 +477,9 @@ module AgentSpaces
       end
       bound.add_subscription(space.watch(Votes::BALLOT_TYPE) { |e| check.call(e.value.payload["proposalId"]) })
       bound.add_subscription(space.watch(Votes::PROPOSAL_TYPE) { |e| check.call(e.value.payload["proposalId"]) })
+      # A quorum that closed on ballots folded before this binding existed raises no event here
+      # again (see start_ballot): judge the proposals already held once at bind time.
+      space.entries(Votes::PROPOSAL_TYPE, limit: BIND_SWEEP_LIMIT).each { |held| check.call(held.value.payload["proposalId"]) }
     end
 
     def start_estimate(bound, method, clause)
@@ -427,15 +488,31 @@ module AgentSpaces
 
       prefix = clause.options[:epochs].to_s
       target = clause.options[:result_space] ? space(clause.options[:result_space]) : nil
-      closer = @aggregate.on_estimate(->(epoch) { epoch.start_with?(prefix) },
-                                      Capabilities::Settle.after(clause.options[:ticks].to_i,
-                                                                 clause.options[:tolerance].to_f)) do |estimate|
+      tolerance = clause.options[:tolerance].to_f
+      settle = estimate_settle(clause, tolerance)
+      closer = @aggregate.on_estimate(->(epoch) { epoch.start_with?(prefix) }, settle) do |estimate|
         result = method.call(estimate)
         target&.write(result, lease: clause.options[:result_lease]) unless result.nil?
       rescue StandardError => e
         log(bound, clause.method_name.to_s, e)
       end
       bound.add_subscription(Struct.new(:closer) { def close = closer.call }.new(closer))
+    end
+
+    # The settle rule of an on_estimate clause, as Java's @OnEstimate reads
+    # it (srad/agentspaces-event-loop.md EL-T-06; DRIFT-FROM-PHASE6 item 5):
+    # settle: a span, ticks: rounds of about a second, neither the default
+    # of ESTIMATE_SETTLE (8 s); both is refused.
+    def estimate_settle(clause, tolerance)
+      settle = clause.options[:settle]
+      ticks = clause.options[:ticks]
+      unless settle.nil? || ticks.nil?
+        raise ArgumentError, "#{clause.method_name}: on_estimate takes settle: or ticks:, not both"
+      end
+      return Capabilities::Settle.span(settle, tolerance) unless settle.nil?
+      return Capabilities::Settle.after(Integer(ticks), tolerance) unless ticks.nil?
+
+      Capabilities::Settle.span(ESTIMATE_SETTLE, tolerance)
     end
 
     def start_propose(bound, method, clause)

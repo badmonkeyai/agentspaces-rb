@@ -419,7 +419,20 @@ module AgentSpaces
       end
 
       # HLC round six, 2026-11-08 (P2): the digests map in the RFC 8949 order.
-      def digest_body(digests) = CBOR.dump({ "digests" => CBOR.canonical_map(digests) })
+      # SPEC v0.1.35 annex I.6: budget, the bytes the answering PULL_RESP may
+      # take, rides after the v0.1.17 fields and is omitted when absent, so an
+      # unbudgeted body keeps its bytes. A sender writes it only toward a card
+      # that carries wire.ae=2.
+      def digest_body(digests, budget: nil)
+        body = { "digests" => CBOR.canonical_map(digests) }
+        unless budget.nil?
+          raise ArgumentError, "a budget is a positive number of bytes: #{budget.inspect}" \
+            unless budget.is_a?(Integer) && budget.positive?
+
+          body["budget"] = budget
+        end
+        CBOR.dump(body)
+      end
 
       # Bodies.ChannelHello: this node accepts channel-attested frames on a
       # connection whose remote end it attested as attested_remote.
@@ -697,10 +710,12 @@ module AgentSpaces
 
       # ------------------------------------------------------------- AgentCards
 
-      # An AgentCard in Java field order; agentPublicKey, actions, and
-      # agentCertificate append and are omitted when absent.
+      # An AgentCard in Java field order; agentPublicKey, actions,
+      # agentCertificate, and threads (SPEC v0.1.38) append and are omitted
+      # when absent or empty, so a card without threads keeps its bytes.
       def agent_card(group, identity, local_name, issued_iso, ttl_iso, description, goals, consumes, produces,
-                     cost_hints, space_bindings, agent_public_raw: nil, actions: nil, agent_certificate: nil)
+                     cost_hints, space_bindings, agent_public_raw: nil, actions: nil, agent_certificate: nil,
+                     threads: nil)
         agent = identity.agent(local_name)
         card = { "id" => "aspace://#{group}/agent/#{agent}", "issuer" => identity.peer_id, "group" => group,
                  "issued" => issued_iso, "ttl" => ttl_iso, "agent" => agent, "description" => description,
@@ -713,8 +728,13 @@ module AgentSpaces
         card["agentPublicKey"] = agent_public_raw unless agent_public_raw.nil?
         card["actions"] = actions if actions && !actions.empty?
         card["agentCertificate"] = agent_certificate unless agent_certificate.nil?
+        card["threads"] = threads if threads && !threads.empty?
         card
       end
+
+      # A ChatThread in Java field order: space, key, scope (exact, tree, or
+      # all; the key is empty exactly when the scope is all).
+      def chat_thread(space, key, scope) = { "space" => space, "key" => key, "scope" => scope }
 
       # A CardAction in Java field order: name, description, consumes,
       # produces, space (omitted when absent), kind.

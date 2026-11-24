@@ -81,10 +81,11 @@ aggregate = AgentSpaces::Capabilities::Aggregate.new(pipes)
 AgentSpaces::Capabilities::Semantic.new(pipes) # answers the coordinator's semantic queries from this cache
 bound = peer.bind(Councillor.new, agent: identity.renewing_subordinate("rb-worker", "PT24H"))
 aggregate.start("load", value)
-aggregate.run(interval_seconds: 0.25)
+aggregate.run # one round a second, as Java's push-sum (SPEC 9.5)
 settled = nil
-# One watch for the whole run: a settle streak needs three ticks with new
-# frames, and the coordinator pushes about once a second.
+# One watch for the whole run: a settle streak needs three rounds with new
+# frames, and the coordinator pushes about once a second; an epoch that goes
+# quiet settles three seconds after its last frame.
 aggregate.on_estimate(->(epoch) { epoch == "load" }, AgentSpaces::Capabilities::Settle.after(3, 0.01)) do |estimate|
   settled = estimate.value
   puts format("  [rb] epoch load settled at %.3f", settled)

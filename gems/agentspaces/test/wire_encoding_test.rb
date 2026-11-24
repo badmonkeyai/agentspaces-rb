@@ -356,6 +356,147 @@ class WireEncodingTest < Minitest::Test
     end
   end
 
+  # AgentCard threads (SPEC v0.1.38 §6.1): the card of agent_card_ui_cbor
+  # with three threads decodes and re-encodes to its bytes; an empty list is
+  # the absent field, so the card keeps its v0.1.37 bytes.
+  def test_agent_card_threads_round_trip_and_an_empty_list_keeps_the_bytes
+    raw = hex("agent_card_threads_cbor")
+    card = Schema.load("AgentCard", raw)
+    assert_equal raw, CBOR.dump(card)
+    assert_equal [Wire.chat_thread("conversations", "main", "tree"),
+                  Wire.chat_thread("conversations", "agent-research", "exact"),
+                  Wire.chat_thread("findings", "", "all")], card["threads"]
+    assert_equal "threads", card.keys.last
+    without = card.reject { |field, _| field == "threads" }
+    assert_equal hex("agent_card_ui_cbor"), CBOR.dump(without)
+
+    identity = golden_identity
+    plain = Wire.agent_card(GOLDEN["group_id"], identity, "python", "2026-01-01T00:00:00Z", "PT15M", "d", [], [], [],
+                            {}, {})
+    assert_equal CBOR.dump(plain), CBOR.dump(Wire.agent_card(GOLDEN["group_id"], identity, "python",
+                                                             "2026-01-01T00:00:00Z", "PT15M", "d", [], [], [], {}, {},
+                                                             threads: []))
+    error = assert_raises(Schema::Error) { Schema.check("AgentCard", card.merge("threads" => [])) }
+    assert_match(/absent when empty/, error.message)
+  end
+
+  def test_every_agent_card_threads_refusal_vector_is_refused_for_its_rule
+    { "adv_agent_card_threads_scope_cbor" => /thread\.scope/, "adv_agent_card_threads_all_key_cbor" => /empty when the scope is all/,
+      "adv_agent_card_threads_key_cbor" => /thread\.key is 1 to 128/, "adv_agent_card_threads_count_cbor" => /at most 16 threads/,
+      "adv_agent_card_threads_twice_cbor" => /distinct/, "adv_agent_card_threads_empty_cbor" => /threads|empty/ }.each do |name, why|
+      error = assert_raises(Schema::Error, name) { Schema.load("AgentCard", hex(name)) }
+      assert_match why, error.message, name
+    end
+  end
+
+  def test_a_thread_holds_its_bounds
+    card = CBOR.load(hex("agent_card_threads_cbor"))
+    accept = [Wire.chat_thread("s" * 128, "k" * 128, "exact"), Wire.chat_thread("s", "a:b", "tree"),
+              Wire.chat_thread("s", "", "all"), Wire.chat_thread("s", "a b", "exact")]
+    Schema.check("AgentCard", card.merge("threads" => accept))
+    Schema.check("AgentCard", card.merge("threads" => Array.new(16) { |i| Wire.chat_thread("s", "k#{i}", "exact") }))
+    [Wire.chat_thread("", "k", "exact"), Wire.chat_thread("s" * 129, "k", "exact"), Wire.chat_thread("a b", "k", "exact"),
+     Wire.chat_thread("s", "", "exact"), Wire.chat_thread("s", "", "tree"), Wire.chat_thread("s", "k" * 129, "exact"),
+     Wire.chat_thread("s", "a\tb", "tree"), Wire.chat_thread("s", "a　b", "exact"), Wire.chat_thread("s", "k", "all"),
+     Wire.chat_thread("s", "k", "Exact"), Wire.chat_thread("s", "k", "")].each do |thread|
+      assert_raises(Schema::Error, thread.inspect) { Schema.check("AgentCard", card.merge("threads" => [thread])) }
+    end
+  end
+
+  ANNEX_I6_DIGEST_REFUSALS = %w[adv_digest_tree_path_nibble_body adv_digest_tree_path_long_body
+                                adv_digest_tree_nodes_length_body adv_digest_tree_nodes_few_body
+                                adv_digest_tree_two_forms_body adv_digest_tree_no_form_body
+                                adv_digest_tree_lines_order_body adv_digest_tree_lines_empty_line_body
+                                adv_digest_ids_twice_body adv_digest_budget_zero_body].freeze
+
+  # The annex I.6 refusal vectors (SPEC v0.1.35, I.8). Java refuses each for
+  # the one form rule it breaks. This reader speaks no wire.ae=2: its
+  # Bodies.Digest names budget, which it writes on a get-space toward a
+  # wire.ae=2 partner (RE-L-03), and never tree, ids or sketch. Every refusal
+  # vector carries tree or ids, so this reader refuses each one earlier,
+  # under P1, for a field its record does not name, and a sender writes
+  # those fields only toward a card that carries wire.ae=2, so the refusal
+  # is the right verdict and not a gap. The accept carriers that hold tree
+  # or ids are refused for the same reason, which shows the reason is P1.
+  def test_every_annex_i6_refusal_vector_is_refused
+    ANNEX_I6_DIGEST_REFUSALS.each do |name|
+      error = assert_raises(Schema::Error, name) { Wire.decode_body("DIGEST", hex(name)) }
+      assert_match(/Bodies\.Digest fields .*"(tree|ids)".* are not Bodies\.Digest's /, error.message, name)
+    end
+    %w[digest_tree_request_body_cbor digest_tree_nodes_body_cbor digest_tree_lines_body_cbor
+       digest_ids_body_cbor].each do |name|
+      assert_raises(Schema::Error, name) { Wire.decode_body("DIGEST", hex(name)) }
+    end
+    # The budget's own form rule, on the field this reader names: zero or a
+    # negative number of bytes is undecodable (annex I.6, The budget).
+    [0, -1].each do |budget|
+      body = CBOR.dump({ "digests" => { "space:tasks" => "".b }, "budget" => budget })
+      error = assert_raises(Schema::Error, budget.to_s) { Wire.decode_body("DIGEST", body) }
+      assert_match(/budget must be positive/, error.message)
+    end
+    error = assert_raises(Schema::Error) { Wire.decode_body("PULL_RESP", hex("adv_pull_resp_remainder_negative_body")) }
+    assert_match(/a remainder is never negative/, error.message)
+  end
+
+  # The budgeted get-space this peer writes is the golden one byte for byte,
+  # and the answer it reads, with or without a remainder, decodes and
+  # re-encodes to its own bytes (SPEC annex I.8; RE-L-03).
+  def test_the_budgeted_get_space_and_its_answers_are_the_golden_bodies
+    body = Wire.digest_body({ "space:tasks" => "".b }, budget: 1_048_576)
+    assert_equal hex("digest_get_space_budget_body_cbor"), body
+    decoded = Wire.decode_body("DIGEST", body)
+    assert_equal 1_048_576, decoded["budget"]
+    assert_equal CBOR.dump({ "digests" => { "space:tasks" => "".b } }), Wire.digest_body({ "space:tasks" => "".b }),
+                 "an unbudgeted body keeps its v0.1.34 bytes"
+    assert_raises(ArgumentError) { Wire.digest_body({ "space:tasks" => "".b }, budget: 0) }
+    resp = Wire.decode_body("PULL_RESP", hex("pull_resp_remainder_body_cbor"))
+    assert_equal({ "space:tasks" => 3 }, resp["remainder"])
+    assert_equal hex("pull_resp_remainder_body_cbor"), CBOR.dump(resp)
+    plain = Wire.decode_body("PULL_RESP", hex("pull_resp_body_cbor"))
+    assert_equal ["space:tasks"], plain["deltas"].keys
+    refute plain.key?("remainder")
+    assert_equal plain["deltas"], resp["deltas"], "the budget changes no delta's bytes"
+  end
+
+  # A Ruby peer acts on no DIGEST but its link holder's (RE-L-03; round 2a,
+  # peer_answer.rb answers the seed's): a verified DIGEST frame of any body
+  # from another member, hostile ones included, is counted as an ignored
+  # kind, decoded by nobody, and leaves the peer's state alone. The signed fetch frame of I.8
+  # verifies here, since the frame's own encoding is unchanged by v0.1.35.
+  def test_a_peer_ignores_every_digest_whatever_its_annex_i6_body
+    frame = Wire.decode_frame(hex("digest_ids_frame_cbor"))
+    refute_nil frame, "the signed fetch frame verifies"
+    assert_equal "DIGEST", frame["kind"]
+    assert_equal hex("digest_ids_body_cbor"), frame["body"]
+    peer = receiver
+    sender = Identity.generate.peer_id
+    ANNEX_I6_DIGEST_REFUSALS.each_with_index do |name, i|
+      stamp = "#{STAMPED}:#{i}:#{sender}"
+      peer.handle(Wire.envelope(peer.group, "DIGEST", sender, stamp, hex(name)))
+    end
+    assert_equal ANNEX_I6_DIGEST_REFUSALS.size, peer.ignored_kinds["DIGEST"]
+    assert_equal 0, peer.malformed_frames
+    assert_empty peer.states
+  end
+
+  # The PING and ACK carriers of I.7 hold v0.1.17 fields this reader already
+  # names, so each decodes and re-encodes to its own bytes.
+  def test_the_v0_1_35_ping_and_ack_carriers_decode_and_re_encode
+    {
+      "ping_hashes_have_body_cbor" => "PING", "ping_hashes_body_cbor" => "PING", "ping_have_body_cbor" => "PING",
+      "ping_hashes_twenty_streams_body_cbor" => "PING", "ack_body_cbor" => "ACK", "ack_hashes_have_body_cbor" => "ACK",
+      "ack_hashes_body_cbor" => "ACK", "ack_have_body_cbor" => "ACK"
+    }.each do |name, kind|
+      body = Wire.decode_body(kind, hex(name))
+      assert_equal hex(name), CBOR.dump(body), name
+      refute body.key?("root"), "#{name} carries no root"
+    end
+    assert_equal 20, Wire.decode_body("PING", hex("ping_hashes_twenty_streams_body_cbor"))["hashes"].size
+    frame = Wire.decode_frame(hex("ping_hashes_have_frame_cbor"))
+    refute_nil frame, "the signed PING frame verifies"
+    assert_equal hex("ping_hashes_have_body_cbor"), frame["body"]
+  end
+
   # Reference rule (HLC round six, 2026-11-08): Java's advertisement, card,
   # founding, and envelope records refuse a null in every field they always
   # write (requireNonNull, or a null Java rewrites to a default and writes
@@ -519,14 +660,16 @@ class WireEncodingTest < Minitest::Test
     peer.pull_ads
     written = peer.write_entry("tasks", "com.acme.WireTask#v1", { "n" => 1 }, tags: { "zz" => "1", "10" => "2", "b" => "3" })
     by_agent = peer.write_entry("tasks", "com.acme.WireTask#v1", { "n" => 2 }, agent: agent)
-    peer.renew_entry("tasks", written)
-    peer.renew_entry("tasks", by_agent, agent: agent)
+    # Each renewal runs past the current lease, so each sends its state (SPEC
+    # 7.2, v0.1.35: one that would end sooner leaves the lease and sends nothing).
+    peer.renew_entry("tasks", written, lease_millis: 1_200_000)
+    peer.renew_entry("tasks", by_agent, agent: agent, lease_millis: 1_200_000)
     space_id = Derive.space_id_local("#{peer.group}/tasks")
     claim = Wire.take_claim(by_agent, space_id, 1, Wire.hlc_now(agent.agent_id, now), agent.agent_id, -0.0, now + 60_000)
     signed = Wire.signed_claim(claim, identity, agent)
     Schema.check("SpaceWire.SignedClaim", signed)
     peer.claims[by_agent] = signed
-    peer.renew_claim("tasks", by_agent, lease_millis: 30_000, agent: agent)
+    peer.renew_claim("tasks", by_agent, lease_millis: 120_000, agent: agent)
     peer.complete_entry("tasks", by_agent, agent: agent)
     card = Wire.agent_card(peer.group, identity, "a", Instants.iso(now - (now % 1000)), "PT15M", "an agent", ["g"],
                            ["c"], ["p"], { "zz" => "1", "b" => "2" }, {}, agent_public_raw: agent.public_raw,

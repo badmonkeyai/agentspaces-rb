@@ -47,7 +47,8 @@ module AgentSpaces
     # when pinned), selects the group (by group_id, else the only one),
     # verifies its founding advertisement with the four checks of SPEC 5.1
     # against group_id when given, and dials the seeds this peer has a
-    # dialer for in priority order. Returns the verified
+    # dialer for in priority order, 250 ms apart (or at once after a refusal),
+    # the first to answer winning. Returns the verified
     # SignedGroupAdvertisement, kept on founding.
     #
     # timeout bounds one attempt (one fetch, one dial of one seed) and
@@ -99,20 +100,25 @@ module AgentSpaces
             last_error = e
           end
         end
-        seeds.each do |seed|
-          remaining = deadline - monotonic
-          break if remaining <= 0
-
-          dialed << seed unless dialed.include?(seed)
+        remaining = deadline - monotonic
+        unless seeds.empty? || remaining <= 0
+          # The document's seeds in its order, staggered 250 ms apart (or at
+          # once after a refusal), the first to answer winning (Harmonization,
+          # rule 2): a silent first seed costs 250 ms, not the dial timeout.
+          check_fork!
           @seeds = seeds
-          begin
-            dial_seed(seed, [timeout, remaining].min)
-          rescue SystemCallError, IOError, SocketError, OpenSSL::SSL::SSLError, Timeout::Error => e
-            last_error = e
-            next
+          seed, channel, failures = dial_first(seeds, timeout: [timeout, remaining].min)
+          if channel
+            dialed << seed unless dialed.include?(seed)
+            adopt_channel(seed, channel)
+            introduce
+            announce_channel
+            pull_revocations
+            connected += 1
+            return founding
           end
-          connected += 1
-          return founding
+          seeds.each { |s| dialed << s unless dialed.include?(s) }
+          last_error = IOError.new(failures.last || "no seed answered")
         end
         now = monotonic
         wait = [slice - (now - started), deadline - now].min
@@ -212,6 +218,5 @@ module AgentSpaces
     def dialable_transports = @dialers.values.flatten.map(&:to_s).uniq
 
     # Peer#connect with the attempt's bound on the dial.
-    def dial_seed(seed, timeout) = connect(seed.host, seed.port, scheme: seed.scheme, timeout: timeout)
   end
 end

@@ -75,6 +75,9 @@ module AgentSpaces
   class Subscription
     attr_reader :reason
 
+    # When the lease lapses, in epoch milliseconds (nil: no lease).
+    attr_reader :expires_ms
+
     def initialize(space, key)
       @space = space
       @key = key
@@ -87,14 +90,21 @@ module AgentSpaces
 
     def open? = !@closed
 
+    # Extends the lease as SPEC 7.2 (v0.1.35) reads "extend" for every
+    # lease: to at least lease from now, never shorter. A subscription whose
+    # lease already lapsed closes as lapsed instead; close it to stop sooner.
     def renew(lease = nil)
       return if @closed
 
       millis = lease.nil? ? @lease_millis : Durations.millis(lease)
       return if millis.nil?
 
+      now = @space.peer.now_ms
+      return close("lapsed") if lapsed?(now)
+
       @lease_millis = millis
-      @expires_ms = @space.peer.now_ms + millis
+      @expires_ms = @expires_ms.nil? ? now + millis : Horizon.renewed_expiry(@expires_ms, now, millis)
+      @space.peer.sweep_hint(@expires_ms)
     end
 
     def renew_millis(millis)
@@ -122,36 +132,202 @@ module AgentSpaces
 
   # A held entry: complete it, with a result or without, or renew it.
   class Taken
-    attr_reader :space, :entry_id, :value, :lease_millis
+    attr_reader :space, :entry_id, :value, :lease_millis, :holder, :epoch
 
     def initialize(space, entry_id, value, lease_millis)
       @space = space
       @entry_id = entry_id
       @value = value
       @lease_millis = lease_millis
+      # The claim this take won, so completing checks that exact claim still holds (SPEC 7.4).
+      # The holder is the take's own, never read back from the lattice: a rival's better claim
+      # can fold between the take's win and this line, and reading it here would make the
+      # completion check the rival's claim and pass (the adversarial review, 2026-11-15). The
+      # epoch is the lattice's only while the claim there is still the take's.
+      @holder = space.agent&.agent_id || space.peer.identity.agent(space.agent_name)
+      claim = space.peer.claim_of(entry_id) || {}
+      @epoch = claim["holder"] == @holder ? claim["epoch"]&.then { |e| Integer(e) } : nil
+      @lock = Mutex.new
+      @lapsed = false
+      @late = false
+      @done = false
+      @on_lapse = []
+      @on_wake = []
+      @guard = nil
+      space.peer.send(:note_held_take, self)
+    end
+
+    # Whether this take was found lapsed (C05, owner decision 2 of
+    # 2026-11-23): by a wake or a wall step, or by a renewal or a result
+    # that came after its claim stopped being this take's or its wall-time
+    # lease ended. It is no longer renewed, and its result is late.
+    def lapsed? = @lock.synchronize { @lapsed }
+
+    # Whether this take has lapsed at wall (epoch ms), judged now (C05, owner
+    # decision 2 of 2026-11-23): its claim is no longer ours (another
+    # holder's, another epoch, or none held here) or its wall-time lease has
+    # expired. A lapse found here is kept, and the take's on_lapse listeners
+    # are told. A completed take has not lapsed.
+    def lapsed_at?(wall)
+      return true if lapsed?
+      return false if done? || held_here?(wall)
+
+      lapse!
+      true
+    end
+
+    # Whether the take completed here.
+    def done? = @lock.synchronize { @done }
+
+    # Calls listener once if the take lapses (at once when it already has):
+    # a keepalive stops renewing.
+    def on_lapse(&listener)
+      now = @lock.synchronize do
+        @on_lapse << listener unless @lapsed
+        @lapsed
+      end
+      listener.call if now
+      self
+    end
+
+    # A binder's end for this take's renewals (item 11 of
+    # DRIFT-FROM-PHASE6, as the core's TakeContext.renew obeys its binder):
+    # a callable returning nil while renewing may go on, or the reason it
+    # may not (the agent unbound). Internal; set before the handler runs.
+    # Calls listener on every wake or wall step that finds this take still
+    # held (C05): a keepalive renews at once rather than at its next cycle.
+    # Returns a callable that removes the listener.
+    def on_wake(&listener)
+      @lock.synchronize { @on_wake << listener }
+      -> { @lock.synchronize { @on_wake.delete(listener) } }
+    end
+
+    def guard=(callable)
+      @lock.synchronize { @guard = callable }
+    end
+
+    # Whether this take's own claim still holds the entry here at wall.
+    def held_here?(wall)
+      claim = @space.peer.claim_of(@entry_id)
+      !claim.nil? && claim["holder"] == @holder && (@epoch.nil? || Integer(claim["epoch"]) == @epoch) &&
+        Integer(claim["expiresAtMillis"]) > wall
+    end
+
+    # Whether this take's own claim is still the one held here, and lapsed at wall.
+    def lease_lapsed?(wall)
+      claim = @space.peer.claim_of(@entry_id)
+      !claim.nil? && claim["holder"] == @holder && (@epoch.nil? || Integer(claim["epoch"]) == @epoch) &&
+        Integer(claim["expiresAtMillis"]) <= wall
     end
 
     # Completes the take, writing result first (into the take's space, or
     # result_space) so a caller correlating on it sees it with the completion.
+    # Raises ArgumentError, writing nothing, when the take no longer holds the
+    # entry: its lease lapsed, a better claim that reached this replica after
+    # the settle window displaced it, or the entry completed meanwhile (SPEC
+    # 7.4, the settle guarantee).
+    # When the holder this take displaced completed the entry first (SPEC 7.4,
+    # rule two), the completion acknowledges that one and raises ArgumentError
+    # before any result is written.
     def complete(result = nil, lease: "1h", tags: nil, result_space: nil)
+      if lapsed_at?(@space.peer.now_ms)
+        # A result after the lapse completes nothing and is counted, once
+        # per take (late_takes; the core's lateTakes).
+        first = @lock.synchronize { @late ? false : (@late = true) }
+        @space.peer.send(:count_late_take) if first
+        raise ArgumentError, "the take of #{@entry_id} lapsed (#{lapse_cause}): its result is late and is not written"
+      end
+      @space.peer.require_held(@entry_id, agent: @space.agent, holder: @holder, epoch: @epoch)
+      unless Peer.present?(@space.peer.states.fetch(@entry_id, {}))
+        raise ArgumentError, "#{@entry_id} is not held here: it is completed or withdrawn"
+      end
+      if @space.peer.outbid_completion?(@entry_id, @holder, @epoch)
+        begin
+          @space.peer.complete_entry(@space.name, @entry_id, agent: @space.agent, holder: @holder, epoch: @epoch)
+        ensure
+          # The acknowledgement completed the entry (rule two): the take is
+          # done, not left for a later wake to find lapsed.
+          finish! unless Peer.present?(@space.peer.states.fetch(@entry_id, {}))
+        end
+      end
+
       result_id = nil
       unless result.nil?
         target = result_space || @space
         target = @space.peer.space(target, agent: @space.agent, agent_name: @space.agent_name) if target.is_a?(String)
         result_id = target.write(result, lease: lease, tags: tags)
       end
-      @space.peer.complete_entry(@space.name, @entry_id, agent: @space.agent)
+      @space.peer.complete_entry(@space.name, @entry_id, agent: @space.agent, holder: @holder, epoch: @epoch)
+      finish!
       result_id
     end
 
     # Extends the take's claim by lease (default: the take's own lease);
-    # returns the new expiry in epoch milliseconds.
+    # returns the new expiry in epoch milliseconds. Raises ArgumentError,
+    # sending nothing, once the take lapsed (here, or as a wake found it),
+    # or once the binder that ran its handler says renewals end (the agent
+    # unbound).
     def renew(lease = nil)
+      lapsed_at?(@space.peer.now_ms)
+      ended = @lock.synchronize do
+        @lapsed ? :lapsed : @guard&.call
+      end
+      ended = "it lapsed (#{lapse_cause})" if ended == :lapsed
+      raise ArgumentError, "the take of #{@entry_id} is not renewed: #{ended}" if ended
+
       millis = lease.nil? ? @lease_millis : Durations.millis(lease)
-      @space.peer.renew_claim(@space.name, @entry_id, lease_millis: millis, agent: @space.agent)
+      @space.peer.renew_claim(@space.name, @entry_id, lease_millis: millis, agent: @space.agent, holder: @holder,
+                                                      epoch: @epoch)
     end
 
     def inspect = "#<AgentSpaces::Taken #{@entry_id} #{@value.inspect}>"
+
+    private
+
+    # Why the take lapsed, as the claim held here shows it now.
+    def lapse_cause
+      claim = @space.peer.claim_of(@entry_id)
+      if claim.nil? then "no claim on the entry is held here any more"
+      elsif claim["holder"] != @holder || (!@epoch.nil? && Integer(claim["epoch"]) != @epoch)
+        "a better claim displaced this take's"
+      else "its lease ended"
+      end
+    end
+
+    # The take completed here: no longer followed.
+    def finish!
+      @lock.synchronize { @done = true }
+      @space.peer.send(:release_held_take, self)
+    end
+
+    # Its handler gave the take up (it raised): the lease lapses to another
+    # taker, and no wake judges it any more.
+    def abandon! = @space.peer.send(:release_held_take, self)
+
+    # The wake re-check found the take still held (Peer#recheck_held_takes).
+    def woke!
+      listeners = @lock.synchronize { @lapsed ? [] : @on_wake.dup }
+      listeners.each do |listener|
+        listener.call
+      rescue StandardError
+        nil
+      end
+    end
+
+    # The take lapsed (lapsed_at?, Peer#recheck_held_takes).
+    def lapse!
+      listeners = @lock.synchronize do
+        next [] if @lapsed
+
+        @lapsed = true
+        @on_lapse.slice!(0..)
+      end
+      listeners.each do |listener|
+        listener.call
+      rescue StandardError
+        nil
+      end
+    end
   end
 
   # One space of the peer's group, by name: the Layer 3 verbs over typed
@@ -278,7 +454,12 @@ module AgentSpaces
       taken = Taken.new(self, entry_id, template.decode(@peer.value_of(dto)&.first), millis)
       return taken if block.nil?
 
-      result = TakeContext.with(taken) { block.call(taken.value, taken) }
+      result = begin
+        TakeContext.with(taken) { block.call(taken.value, taken) }
+      rescue StandardError
+        taken.send(:abandon!) # re-raised: the take is only given up, and lapses to another taker
+        raise
+      end
       result.is_a?(Tagged) ? taken.complete(result.value, tags: result.tags) : taken.complete(result)
       result
     end
@@ -298,7 +479,7 @@ module AgentSpaces
         subscription = Subscription.new(self, key)
         @watchers[key] = [template, callback, Set.new, subscription, wanted]
         subscription
-      end
+      end.tap { @peer.sweep_hint(@peer.now_ms) }
     end
 
     # The leased push subscription of the Java space: events reach the block
@@ -341,10 +522,14 @@ module AgentSpaces
     def state_folded(dto)
       return unless mine?(dto)
 
+      @peer.sweep_hint(Peer.lease_of(dto).fetch("expiresAtMillis", 0).to_i) if watching? && Peer.present?(dto)
       if dto["completed"]
         deliver(dto, COMPLETED)
-      elsif Peer.present?(dto)
-        deliver(dto, WRITTEN) # a withdrawn entry learned late is history, not news
+      elsif Peer.present?(dto) && Peer.lease_of(dto).fetch("expiresAtMillis", 0).to_i > @peer.now_ms
+        # WRITTEN is for an entry a reader here could see, present and unexpired, as Java's
+        # ReplicatedSpace raises it: one withdrawn or already lapsed when it merges is history,
+        # not news (SPEC 7.2, completed on arrival; the adversarial review, 2026-11-15).
+        deliver(dto, WRITTEN)
       end
     end
 
@@ -355,11 +540,44 @@ module AgentSpaces
       deliver(dto, EXPIRED) if mine?(dto)
     end
 
-    def claim_folded(entry_id, _signed)
+    # Entries the peer collected past their horizon: their marks go too, so a
+    # long-lived watch holds marks for the entries the replica holds.
+    def states_collected(entry_ids)
+      @lock.synchronize { @watchers.each_value { |w| w[2].delete_if { |entry_id, _| entry_ids.include?(entry_id) } } }
+    end
+
+    def claim_folded(entry_id, signed)
       dto = @peer.states[entry_id]
       return if dto.nil? || !mine?(dto) || !Peer.present?(dto)
 
+      @peer.sweep_hint(signed.dig("claim", "expiresAtMillis").to_i) if watching? && signed.is_a?(Hash)
+
       deliver(dto, TAKEN)
+    end
+
+    # The earliest wall instant (epoch ms) after now at which sweep has
+    # something to judge: a subscription's lease, a present entry's lease, or
+    # its claim's expiry; nil with no watch (SPEC 9.5: the space sweep runs
+    # when the earliest lapse falls due). A lapsed entry whose value is not
+    # held yet is judged again a second later, when its block may be here.
+    def next_sweep_ms(now)
+      return nil if @watchers.empty?
+
+      times = @watchers.values.filter_map { |w| w[3].expires_ms }
+      @peer.states.to_a.each do |entry_id, dto|
+        next if !mine?(dto) || !Peer.present?(dto)
+
+        lease = Peer.lease_of(dto).fetch("expiresAtMillis", 0).to_i
+        if lease > now
+          times << lease
+        elsif !@peer.payload_held?(dto)
+          times << now + 1000
+        end
+        claim = @peer.claim_of(entry_id)
+        expiry = claim && claim.fetch("expiresAtMillis", 0).to_i
+        times << expiry if expiry && expiry > now
+      end
+      times.min
     end
 
     # Closes every lapsed subscription, then delivers EXPIRED once per entry
@@ -401,6 +619,11 @@ module AgentSpaces
       return if @watchers.empty?
 
       record = dto["record"] || {}
+      # Completed on arrival (SPEC 7.2, v0.1.35): an entry that completed carries
+      # its event only when its value is already held here; its block is not
+      # fetched for an event alone.
+      return if kind == COMPLETED && !@peer.payload_held?(dto)
+
       value = @peer.value_of(dto)
       return if value.nil?
 

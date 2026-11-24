@@ -117,6 +117,8 @@ class AgentTest < Minitest::Test
     assert_raises(DefinitionError) { Class.new { include AgentSpaces::Agent; take(Shop::Task, space: "x", post: %w[a] * 33) { nil } } }
     error = assert_raises(DefinitionError) { Class.new { include AgentSpaces::Agent; take(Shop::Task, space: "x", cost: "x" * 65) { nil } } }
     assert_match(/cost is a text of at most 64 characters/, error.message)
+    error = assert_raises(DefinitionError) { Class.new { include AgentSpaces::Agent; take(Shop::Task, space: "x", concurrency: 0) { nil } } }
+    assert_match(/concurrency is a positive whole number of take loops, got 0/, error.message)
     dangling = Class.new do
       include AgentSpaces::Agent
       take Shop::Task, space: "tasks"
@@ -171,6 +173,35 @@ class AgentTest < Minitest::Test
     @peer.states.values.each { |dto| @peer.fold_state(dto.dup) }
     sleep 0.3
     assert_equal ["rel:1"], panelist.decided
+  ensure
+    bound&.close
+  end
+
+  # R2 (2026-11-16): a council worker joined, the coordinator's proposal came by rumor at once, and
+  # the worker bound its agent a second later. A pull with the replica's own digest never sends that
+  # proposal again, so a binding that only watched for new folds never cast. The binding now reads
+  # the proposals already held when it binds.
+  def test_a_binding_made_after_the_proposals_folded_still_casts_and_decides_once
+    Votes.propose(@other, "votes", "rel:open", "ship 1.0?", %w[yes no], 2)
+    Votes.propose(@other, "votes", "rel:closed", "ship 0.9?", %w[yes no], 1)
+    Votes.cast(@other, "votes", "rel:closed", "no")
+    Votes.propose(@other, "votes", "ops:3", "ship?", %w[yes no], 1)
+    # Liveness ceilings, not expectations: each lands in milliseconds.
+    assert eventually(30) { Votes.decision(@peer.states, "rel:closed") && Votes.proposals(@peer.states).key?("ops:3") }
+    panelist = Panelist.new
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    bound = Binder.new(@peer, publish_card: false).bind(panelist)
+    assert eventually(30) { Votes.tally(@peer.states, "rel:open")["yes"] == 1 }
+    assert eventually(30) { panelist.decided == ["rel:closed"] }
+    puts format("late bind: ballot and decision within %.3f s", Process.clock_gettime(Process::CLOCK_MONOTONIC) - started)
+    # The held proposal is not judged twice: refolding everything raises no second ballot or decision.
+    @peer.states.values.each { |dto| @peer.fold_state(dto.dup) }
+    sleep 0.3
+    mine = Votes.ballots(@peer.states, "rel:open").count { |record, _, _| record["issuer"].to_s.start_with?(@peer.identity.peer_id) }
+    assert_equal 1, mine
+    assert_equal ["rel:closed"], panelist.decided
+    # The prefix still filters what the binding reads at bind time.
+    assert_empty Votes.ballots(@peer.states, "ops:3")
   ensure
     bound&.close
   end
@@ -251,6 +282,28 @@ class AgentTest < Minitest::Test
   def test_an_ordered_verb_refuses_the_wire_engine_naming_the_jruby_face
     error = assert_raises(EngineUnsupported) { @peer.bind(Ordered.new) }
     assert_match(/runs on the Java binder; bind this agent with the JRuby face/, error.message)
+  end
+
+  # @SpaceTake(concurrency) on the Ruby binder: two loops hold two entries at
+  # once, where one loop would hold the second entry until the first returns.
+  def test_take_concurrency_serves_that_many_entries_at_once
+    started = Queue.new
+    release = Queue.new
+    pair = AgentSpaces.agent("pair") do
+      take(Shop::Task, space: "tasks", lease: "1m", poll_timeout: "300ms", concurrency: 2) do |task|
+        started << task.topic
+        release.pop(timeout: 10)
+        nil
+      end
+    end
+    bound = @peer.bind(pair, publish_card: false)
+    @other.space("tasks") << Shop::Task.new(topic: "a", priority: 1)
+    @other.space("tasks") << Shop::Task.new(topic: "b", priority: 1)
+    seen = [started.pop(timeout: 10), started.pop(timeout: 10)]
+    assert_equal %w[a b], seen.compact.sort, "both entries are held before either body returns"
+  ensure
+    2.times { release << :go } if release
+    bound&.close
   end
 
   def test_a_raising_body_lapses_the_take_and_counts_the_failure

@@ -575,6 +575,48 @@ class RobustnessTest < Minitest::Test
     assert_equal [2, 1, 0], [peer.deltas_undecodable, peer.malformed_frames, peer.stamps_logical_refused]
   end
 
+  # The mixed idle run of 2026-11-23: a dial-only member that joined earlier
+  # refreshes its card to its seed alone, so a later joiner holds it only from
+  # the seed's answer to the view pull (SPEC 5.2, v0.1.21), which rides along
+  # the join's revocation pull and names the members whose cards it holds.
+  def test_a_join_pulls_the_view_and_holds_a_member_that_joined_before_it
+    peer = CapturingPeer.new
+    peer.pull_revocations
+    digests = CBOR.load(peer.sent.last[1])["digests"]
+    assert_equal "#{peer.identity.peer_id}\n", digests["view"]
+    seed = Identity.generate
+    earlier = Identity.generate
+    now = peer.now_ms
+    ad = Wire.peer_advertisement(GROUP, earlier, Instants.iso(now - (now % 1000)), "PT10M")
+    deltas = { "view" => CBOR.dump([Wire.signed_peer_ad(ad, earlier)]) }
+    peer.handle(frame(seed, "PULL_RESP", CBOR.dump({ "deltas" => deltas }), peer.identity.peer_id, stamp(now, 1)))
+    assert_includes peer.view_members, earlier.peer_id
+    assert_equal [earlier.peer_id, peer.identity.peer_id].sort.map { |id| "#{id}\n" }.join, peer.view_digest
+  end
+
+  # The mixed idle run of 2026-11-23: every card this peer held of a member
+  # that refreshes only over its own links (a Java member's direct refresh
+  # never reaches a dial-only peer) lapsed at 10 minutes. The re-lease duty
+  # pulls the view naming only the cards that do not end within the margin,
+  # so the seed sends the current card of the rest; a lapsed card asks nothing.
+  def test_the_re_lease_repulls_the_cards_ending_soon_and_names_the_rest
+    peer = CapturingPeer.new
+    now = peer.now_ms
+    ending, fresh, gone = Array.new(3) { Identity.generate }
+    { ending => now - 500_000, fresh => now, gone => now - 700_000 }.each do |who, issued|
+      ad = Wire.peer_advertisement(GROUP, who, Instants.iso(issued - (issued % 1000)), "PT10M")
+      peer.send(:accept_peer_ad, Wire.signed_peer_ad(ad, who))
+    end
+    assert peer.send(:cards_ending?)
+    peer.send(:pull_view)
+    kind, body = peer.sent.last
+    assert_equal "DIGEST", kind
+    named = CBOR.load(body)["digests"]["view"].split("\n")
+    assert_equal [fresh.peer_id, peer.identity.peer_id].sort, named, "the ending and the lapsed cards are asked for"
+    assert_equal 1, peer.send(:view_pulls)
+    assert_equal 180_000, AgentSpaces::Peer::VIEW_REFRESH_MARGIN_MS
+  end
+
   # HLC round four, 2026-11-08 (D3): a frame whose stamp is anything but a
   # canonical CBOR text does not decode, even under a signature over its raw
   # bytes, and the peer counts it as a malformed frame.
@@ -657,7 +699,9 @@ class RobustnessTest < Minitest::Test
     refute peer.states.key?(waits["record"]["entryId"])
     assert_equal [0, 1], [peer.stamps_far_future_refused, peer.stamps_far_future_deferred],
                  "a stamp on the hour waits and counts as deferred"
-    hostile = signed_write(writer, "#{hour + 1}:0:#{issuer}", "#{hour + 1}:0:#{issuer}", WALL)
+    # Its lease runs past the hour, so once the wall catches up the state is
+    # live and not a lapse past its horizon, which the door of SPEC 7.3 refuses.
+    hostile = signed_write(writer, "#{hour + 1}:0:#{issuer}", "#{hour + 1}:0:#{issuer}", hour)
     3.times { peer.fold_state(hostile) }
     refute peer.states.key?(hostile["record"]["entryId"])
     assert_equal 1, peer.stamps_far_future_refused, "a hostile record counts once"
@@ -1316,7 +1360,7 @@ class RobustnessTest < Minitest::Test
     peer.reconnect_window = 0.1
     dials = []
     dialer = Object.new
-    dialer.define_singleton_method(:open) do |_seed, identity:|
+    dialer.define_singleton_method(:open) do |_seed, identity:, timeout: 10|
       dials << Process.clock_gettime(Process::CLOCK_MONOTONIC)
       peer.instance_variable_set(:@running, false) if dials.size >= 8 # the owner closes the peer
       raise Errno::ECONNREFUSED, "refused"
@@ -1327,9 +1371,13 @@ class RobustnessTest < Minitest::Test
     refute peer.send(:reconnect)
     assert_equal 8, dials.size, "the dials went on past the window"
     gaps = dials.each_cons(2).map { |a, b| b - a }
-    assert_operator gaps[0], :>=, 0.02
-    assert_operator gaps[2], :>=, 0.08
-    assert(gaps.all? { |g| g <= (0.12 * 1.25) + 0.05 }, gaps.inspect)
+    # The redial table at a 0.02 s interval: 0.02, 0.04, 0.08, 0.12, then
+    # 0.02 again, each within the 10 % spread.
+    assert_operator gaps[0], :>=, 0.02 * 0.9
+    assert_operator gaps[2], :>=, 0.08 * 0.9
+    assert_operator gaps[3], :>=, 0.12 * 0.9
+    assert_operator gaps[4], :<, 0.12 * 0.9, "the table wrapped"
+    assert(gaps.all? { |g| g <= (0.12 * 1.1) + 0.05 }, gaps.inspect)
   end
 
   # Swarm retries, the gate's adversarial review (ROBUSTNESS.md 10.6): a seed

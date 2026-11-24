@@ -36,10 +36,12 @@ module AgentSpaces
 
     LISTENER_KEYS = %w[bind advertise roles].freeze
     HONOURED = %w[keystore tick-millis peer-ad-interval-millis card-refresh-millis security groups identity
-                  allow-plain transport capabilities coalesce-millis multicast].freeze
+                  allow-plain transport capabilities coalesce-millis multicast ttl].freeze
+    # The card TTL a binder publishes under (Binder's card_ttl default).
+    CARD_TTL_MILLIS = 600_000
 
     attr_reader :keystore, :tick_millis, :peer_ad_interval_millis, :card_refresh_millis, :profile, :groups,
-                :agent_keys, :agent_keystore, :allow_plain, :ignored
+                :agent_keys, :agent_keystore, :allow_plain, :ignored, :ttl_strict, :ttl_overrides
 
     # source: a Hash (with or without the agentspaces: key), a path to a YAML
     # file, or YAML text. Keyword options are the same keys in Ruby form.
@@ -87,6 +89,11 @@ module AgentSpaces
       @tick_millis = Integer(tree.fetch("tick-millis", 250))
       @peer_ad_interval_millis = Integer(tree.fetch("peer-ad-interval-millis", 30_000))
       @card_refresh_millis = Integer(tree.fetch("card-refresh-millis", 300_000))
+      # The TTL floor (TtlFloor): agentspaces.ttl.strict refuses a TTL under
+      # 60 s with no reason; ttl.expert-overrides names a key and its reason.
+      ttl = tree["ttl"] || {}
+      @ttl_strict = ttl["strict"] == true
+      @ttl_overrides = (ttl["expert-overrides"] || {}).to_h { |k, v| [k.to_s, v] }
       security = tree["security"] || {}
       @profile = (security["profile"] || "dev-local").to_s
       identity = tree["identity"] || {}
@@ -95,6 +102,14 @@ module AgentSpaces
       @allow_plain = tree["allow-plain"] == true
       @groups = Array(tree["groups"]).map { |g| group(g) }
       raise ConfigError, "the configuration names no group; add agentspaces.groups[] with a name" if @groups.empty?
+    end
+
+    # The TTL floor this configuration asks for (TtlFloor), its own keys
+    # checked: the card refresh against the card TTL it renews.
+    def ttl_floor(logger: nil)
+      floor = TtlFloor.new(strict: @ttl_strict, overrides: @ttl_overrides, logger: logger)
+      floor.check_cycle("agentspaces.card-refresh-millis", CARD_TTL_MILLIS, @card_refresh_millis)
+      floor
     end
 
     def group_named(name = nil)
@@ -134,7 +149,9 @@ module AgentSpaces
       check_seeds!(config, chosen)
       identity = config.keystore ? Identity.load_or_create(config.keystore) : Identity.generate
       group_id = chosen.group_id || Derive.group_id_from_founding(chosen.founding)
+      floor = config.ttl_floor(logger: logger)
       peer = Peer.new(identity, group_id, logger: logger, clock: clock)
+      peer.ttl_floor = floor
       peer.peer_ad_interval = config.peer_ad_interval_millis / 1000.0
       if chosen.founding.nil?
         join_by_id(peer, chosen, group_id)

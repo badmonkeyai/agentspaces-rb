@@ -172,7 +172,9 @@ class GoldenTest < Minitest::Test
   end
 
   def test_decoder_round_trips_every_golden_vector
-    names = GOLDEN.keys.select { |n| n.end_with?("_cbor", "_delta") }
+    # The annex I.6 refusal bodies (v0.1.35, adv_*_body) are well-formed CBOR that break a
+    # record's form rule, so they round-trip like the rest.
+    names = GOLDEN.keys.select { |n| n.end_with?("_cbor", "_delta", "_body") }
     assert_operator names.size, :>=, 35
     names.each do |name|
       # A persistent-tree node is a definite-length map (srad/agentspaces-pdt.md 10.2), not a

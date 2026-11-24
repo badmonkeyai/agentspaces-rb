@@ -51,21 +51,25 @@ module AgentSpaces
       end
 
       # n peers of one group that have introduced themselves to each other.
-      def self.fleet(group, count, clock: nil)
+      # time: a shared VirtualTime (each peer's loop is then the test's to run).
+      def self.fleet(group, count, clock: nil, time: nil, dialled: false)
         network = new
-        peers = Array.new(count) { NetPeer.new(network, group, clock: clock) }
+        peers = Array.new(count) { NetPeer.new(network, group, clock: clock, time: time, dialled: dialled) }
         peers.each(&:introduce)
         peers
       end
     end
 
     # A peer of a Network: sends are delivered in-process, and a rumor of its
-    # own folds here as well (gossip hands it back to us).
+    # own folds here as well (gossip hands it back to us). dialled: true
+    # gives it a dialled peer's duties (the keepalive and the collection),
+    # which an in-process peer otherwise leaves to the test.
     class NetPeer < Peer
-      def initialize(network, group, clock: nil, identity: nil)
-        super(identity || Identity.generate, group, clock: clock)
+      def initialize(network, group, clock: nil, identity: nil, time: nil, dialled: false)
+        super(identity || Identity.generate, group, clock: clock, time: time)
         @network = network
         @running = true
+        @dialled = dialled
         network.add(self)
       end
 

@@ -12,6 +12,7 @@ fleet.bind(Fulfiller.new)                                      # the same class,
 - Every transport the Java node offers, and the verbs only the Java binder runs: `ordered_take`, `reduce`, and the leased and ordered join modes.
 - `fleet.ordered(space, members:)` forms the node's member of an ordered log, so exactly-once clerks need no Java wiring.
 - An entry whose schema names a Java class on the class path binds to that class; add jars or class directories with `AGENTSPACES_CLASSPATH`.
+- A renewal extends a lease to at least the given time from now and never shortens it, as the Java node renews (SPEC v0.1.35 §7.2). Cancel an entry to end it sooner.
 
 JRuby 10.1 on a JDK 21 or newer: the face compiles Java source for each agent shape with the JDK's compiler. The gem carries the `agentspaces-runtime` jars of its version. See the [repository README](https://github.com/badmonkeyai/agentspaces-rb#jruby).
 

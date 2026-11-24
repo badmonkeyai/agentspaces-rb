@@ -61,8 +61,15 @@ module AgentSpaces
       "Bodies.Ack" => [["nonce", :long], ["onBehalf", :id], ["root", :bytes, :null],
                        ["hashes", %i[map bytes], :null], ["have", [:list, "Bodies.HaveItem"], :null]],
       "Bodies.Rumor" => [["streamId", :text], ["itemId", :text], ["hopsRemaining", :int], ["payload", :bytes]],
-      "Bodies.Digest" => [["digests", %i[map bytes]], ["hashes", %i[map bytes], :null], ["want", TEXTS, :null]],
-      "Bodies.PullResp" => [["deltas", %i[map bytes]]],
+      # SPEC v0.1.35 annex I.6 (replication by entry, RE-L-03): this client
+      # writes budget on a get-space toward a wire.ae=2 partner and reads the
+      # remainder of the answer, so both records name them. It runs no trie
+      # audit and advertises no wire.ae=2, so tree, ids and sketch stay
+      # unnamed and a body carrying one is undecodable here (P1), as a member
+      # without the hint drops it.
+      "Bodies.Digest" => [["digests", %i[map bytes]], ["hashes", %i[map bytes], :null], ["want", TEXTS, :null],
+                          ["budget", :long, :null]],
+      "Bodies.PullResp" => [["deltas", %i[map bytes]], ["remainder", %i[map long], :null]],
       "Bodies.RelayFrame" => [["target", :id], ["frame", :bytes], ["path", %i[list id], :null], ["hop", :int, :null]],
       "Bodies.Batch" => [["frames", %i[list bytes]]],
       "Bodies.Have" => [["items", [:list, "Bodies.HaveItem"]]],
@@ -101,7 +108,11 @@ module AgentSpaces
                                 ["produces", TEXTS], ["costHints", TEXT_MAP], ["spaceBindings", TEXT_MAP],
                                 ["agentPublicKey", :bytes, :null], ["actions", [:list, "CardAction"], :null],
                                 ["agentCertificate", "AgentCertificate", :null], ["ui", "UiDeclaration", :null],
-                                ["spill", "CardSpill", :null]],
+                                ["spill", "CardSpill", :null], ["threads", [:list, "ChatThread"], :empty]],
+      # AgentCard threads, 2026-11-23 (SPEC v0.1.38 §6.1): the conversations
+      # the agent answers, appended last and omitted when absent or empty, so a
+      # card without them keeps its v0.1.37 bytes.
+      "ChatThread" => [["space", :text], ["key", :text], ["scope", :text]],
       # AppCard origin and formats, 2026-11-09 (SPEC v0.1.32 §6.1a.2 and
       # §6.1a.5): origin, formats, and spill append after host, each omitted
       # when absent, so a card without them keeps its v0.1.31 bytes.
@@ -230,6 +241,12 @@ module AgentSpaces
     # AgentCertificate's checks join them, so a delta that carries such a
     # record is undecodable here as in Java.
     CONSTRUCTOR_CHECKS = {
+      # Annex I.6: a budget is a positive number of bytes, and a remainder
+      # counts states, so neither is zero or negative where the record names it.
+      "Bodies.Digest" => ->(digest) { !digest.key?("budget") || digest["budget"].positive? || "budget must be positive" },
+      "Bodies.PullResp" => lambda do |resp|
+        (resp["remainder"] || {}).values.all? { |left| !left.negative? } || "a remainder is never negative"
+      end,
       "TakeClaim" => lambda do |claim|
         if !claim["epoch"].positive? then "epoch must be positive"
         elsif !claim["bid"].finite? then "bid must be finite"
@@ -256,6 +273,7 @@ module AgentSpaces
       "AppCard.Parts" => ->(parts) { Cards.app_parts_check(parts) },
       "CardSpill" => ->(spill) { Cards.spill_check(spill) },
       "AgentCard" => ->(card) { Cards.agent_card_check(card) },
+      "ChatThread" => ->(thread) { Cards.chat_thread_check(thread) },
       "UiDeclaration" => ->(ui) { Cards.ui_declaration_check(ui) },
       "UiDeclaration.Entries" => ->(entries) { Cards.ui_entries_check(entries) },
       "UiDeclaration.Component" => ->(component) { Cards.ui_component_check(component) },
@@ -277,8 +295,8 @@ module AgentSpaces
     NON_NULL = {
       "Envelope" => %w[to], "RevocationAdvertisement" => %w[successor]
     }.merge(%w[AgentCard AppCard AppCard.Ui AppCard.Host AppCard.Origin AppCard.Parts AssetCard CapabilityAdvertisement
-               CardAction CardSpill CardAction.Contract CredentialRevocation CredentialRevocation.Target GroupAdvertisement
-               GroupAdvertisement.GossipParameters GroupFounding.FoundingFields GroupFounding.FoundingDocument
+               CardAction CardSpill CardAction.Contract ChatThread CredentialRevocation CredentialRevocation.Target
+               GroupAdvertisement GroupAdvertisement.GossipParameters GroupFounding.FoundingFields GroupFounding.FoundingDocument
                ModelCard PeerAdvertisement PeerAdvertisement.Endpoint SignedGroupAdvertisement SpaceAdvertisement
                UiDeclaration UiDeclaration.Component UiDeclaration.Entries].to_h { |name| [name, []] }).freeze
 

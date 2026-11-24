@@ -7,7 +7,7 @@ chat = RubyLLM.chat.with_tools(*AgentSpaces::RubyLLM.tools(peer))
 ```
 
 - One RubyLLM tool per invocable action the peer's cached AgentCards declare; a model's tool call writes the input entry into the action's task space and awaits the correlated result.
-- `AgentSpaces::Lease.keepalive` renews a take's lease on a timer while the take's body waits on a model, so a slow call does not hand the work to another member.
+- `AgentSpaces::Lease.keepalive` renews a take's lease on a timer while the take's body waits on a model, so a slow call does not hand the work to another member. A take that lapsed, its claim no longer its own or its lease ended while the machine slept, stops renewing at once, and the keepalive raises once the body returns, since its result is late. Inside a bound agent's take, the renewals end once the agent is unbound.
 
 RubyLLM 2.1 or newer, Ruby 3.3 or newer. See the [repository README](https://github.com/badmonkeyai/agentspaces-rb#how-to-use-ai-with-agentspaces).
 

@@ -151,7 +151,9 @@ module AgentSpaces
     # A server whose tool list follows the fleet: `refresh` rebuilds it from
     # the cards and, when it changed, tells connected clients
     # (notifications/tools/list_changed). With refresh_every (seconds) a
-    # thread refreshes on that interval until `close`.
+    # thread refreshes when the peer's advertisement cache changes and when
+    # the earliest card lapses, and at the latest every refresh_every
+    # seconds, until `close` (SPEC 9.5: due work, not a fixed-rate poll).
     class Gateway
       attr_reader :server
 
@@ -190,11 +192,25 @@ module AgentSpaces
 
       private
 
+      # Until the cache changes, the earliest card lapses, or interval passes.
+      def wait_for_change(interval)
+        unless @peer.respond_to?(:await_ads_change)
+          sleep interval
+          return
+        end
+
+        @seen = @peer.ads_version if @seen.nil?
+        lapse = @peer.next_card_expiry_ms
+        wait = lapse.nil? ? interval : [interval, [(lapse - @peer.now_ms) / 1000.0, 0.0].max + 0.001].min
+        @peer.await_ads_change(@seen, wait)
+        @seen = @peer.ads_version
+      end
+
       def start(interval)
         Thread.new do
           Thread.current.name = "agentspaces-mcp-refresh"
           loop do
-            sleep interval
+            wait_for_change(interval)
             begin
               refresh
             rescue StandardError => e

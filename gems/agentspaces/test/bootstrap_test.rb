@@ -392,9 +392,9 @@ class BootstrapTest < Minitest::Test
       ad = self_ad(seed)
       # The join hint rides beside the session hint, as the Java node's does in SESSION mode, and
       # beside the recordless and AppCard wire hints (srad/agentspaces-pdt.md PD-L-04; AppCard origin and
-      # formats, 2026-11-09).
-      assert_equal({ "aspace:join" => SOCIAL["credential"], Peer::APPCARD_HINT => "2", Session::HINT => "1",
-                     Peer::RECORDLESS_HINT => "1" }, ad["resourceHints"])
+      # formats, 2026-11-09), and beside wire.horizon (SPEC v0.1.35 7.3, RE-L-03).
+      assert_equal({ "aspace:join" => SOCIAL["credential"], Peer::APPCARD_HINT => "2", Horizon::HINT => "1",
+                     Session::HINT => "1", Peer::RECORDLESS_HINT => "1" }, ad["resourceHints"])
       assert_equal SOCIAL["candidate_peer_id"], ad["issuer"]
       assert_equal SOCIAL["group_id"], ad["group"]
       # The hint is bound into the signed advertisement bytes.

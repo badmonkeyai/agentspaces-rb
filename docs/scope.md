@@ -16,6 +16,7 @@ The JRuby face (`agentspaces-jruby`) binds the same agent classes through the Ja
 | Transports | Dials `tcp`, `tls`, `ws`, `wss`, `http`, and `https`. A plain seed on a non-loopback host needs `allow_plain: true`. |
 | TLS | `tls` and `wss` run TLS 1.3 with a channel certificate and attest the remote end. On `tcp`, `ws`, and `http` the peer runs session attestation. The Java council test runs the Ruby worker over `tls` with attestation required. |
 | Spaces | `write`, `read`, `all`, `entries`, `take`, `complete`, `renew`, `watch`, `notify`, and `stream`. A take may claim through the ordered log: `space.take(Type, through: log)`. |
+| Renewal and collection (SPEC v0.1.35) | A renewal extends a lease to at least the extension from now and never shortens it, for writes, takes, and subscriptions. Only the issuer renews, and only an entry present and unexpired on its replica. The peer advertises `wire.horizon=1`, collects entries past their horizon (the lapse horizon, the drift floor, and the per-entry horizon while every member in view carries the hint), and refuses a collected entry that a partner offers again. Toward a member whose card carries `wire.ae=2`, a pull asks for a budget of 1 MiB and continues with the peer's own text digest while states are left out. |
 | Agent verbs | `take`, `notify`, `bid`, `ballot`, `on_decision`, `propose`, the local `join`, and `on_estimate`, with every return convention of the Python binder. |
 | Cards | Publishes each bound agent's AgentCard with its actions and republishes it while the agent stays bound. `publish_ad` sends any advertisement. Reads and checks AgentCards, AppCards (with `host`, `origin`, `formats`, and `ui`), AssetCards, ModelCards, and the capability, space, and group advertisements. Resolves a spilled card through an attached spill store. |
 | Capabilities | Votes, the push-sum aggregate, semantic discovery, remote actions, the connector clients (`DataQueryClient`, `AssetInvocations`), and the ordered-log client. |
@@ -34,6 +35,7 @@ Each row names a feature the MRI peer does not run yet, and which other client r
 |---|---|---|---|---|
 | A listener, so a Ruby process can be a seed | dials only; use the Node host or a Java peer as the seed | no | yes, the Node host | yes |
 | `dtls`, `udp`, `quic`, and `webrtc` | skips a seed of these schemes | no | `webrtc` | yes |
+| The trie audit of `wire.ae=2`: `tree` and `ids` (SPEC annex I.6) | pulls by budgeted get-space and its text digest, refuses a `DIGEST` that carries `tree` or `ids`, and acts on no `DIGEST` | no | planned | yes |
 | The content swarm: publish and fetch large artifacts by manifest, holdings, and pieces | none | yes | yes | yes |
 | Spilling a large card to the content swarm | sends the card inline and counts `cards_oversize_inline` | yes | yes | yes |
 | Publishing an AppCard's `origin`, `formats`, or `idp` host | drops them and counts `app_cards_downgraded` | yes | yes | yes |

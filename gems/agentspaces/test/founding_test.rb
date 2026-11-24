@@ -210,6 +210,12 @@ class FoundingTest < Minitest::Test
     end
   end
 
+  # Every adv_ vector has a reader verdict in some test of this suite. The
+  # annex I.6 bodies of v0.1.35 (adv_digest_*, adv_pull_resp_*) are judged in
+  # wire_encoding_test.rb: those carrying tree or ids under P1, since this
+  # reader names budget and remainder alone, and the negative remainder by its
+  # form rule. The AgentCard threads refusals of v0.1.38 (adv_agent_card_threads_*)
+  # are judged there too.
   def test_every_hostile_adv_input_is_covered
     covered = %w[adv_claim_bad_signature_delta adv_claim_transplanted_delta adv_claim_nan_bid_delta
                  adv_claim_epoch_zero_delta adv_claim_epoch_jump_delta adv_claim_eternal_delta adv_deep_nesting_cbor
@@ -232,7 +238,14 @@ class FoundingTest < Minitest::Test
                  adv_app_card_origin_ref_bound_cbor adv_app_card_spill_placeholder_cbor
                  adv_app_card_spill_parts_order_cbor adv_app_card_spill_parts_unknown_cbor
                  adv_app_card_spill_parts_empty_cbor adv_app_card_spill_root_codec_cbor
-                 adv_app_card_spill_size_zero_cbor adv_agent_card_spill_actions_cbor]
+                 adv_app_card_spill_size_zero_cbor adv_agent_card_spill_actions_cbor
+                 adv_digest_tree_path_nibble_body adv_digest_tree_path_long_body adv_digest_tree_nodes_length_body
+                 adv_digest_tree_nodes_few_body adv_digest_tree_two_forms_body adv_digest_tree_no_form_body
+                 adv_digest_tree_lines_order_body adv_digest_tree_lines_empty_line_body adv_digest_ids_twice_body
+                 adv_digest_budget_zero_body adv_pull_resp_remainder_negative_body
+                 adv_agent_card_threads_scope_cbor adv_agent_card_threads_all_key_cbor
+                 adv_agent_card_threads_key_cbor adv_agent_card_threads_count_cbor
+                 adv_agent_card_threads_twice_cbor adv_agent_card_threads_empty_cbor]
     assert_equal [], GOLDEN.keys.grep(/\Aadv_/) - covered
   end
 end
